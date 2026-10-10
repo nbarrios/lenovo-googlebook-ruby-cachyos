@@ -1,0 +1,17 @@
+[Unit]
+Description=Load Xe graphics on Ruby after the coreboot-framebuffer boot phase
+# Xe is blacklisted on the kernel command line and in modprobe.d so the LUKS
+# prompt stays on the firmware framebuffer. One explicit load, matching the
+# physical console test, then hands the panel to Xe. No unload/reload on Ruby.
+After=systemd-modules-load.service local-fs.target
+Before=display-manager.service greetd.service
+ConditionPathExists=/etc/asus-boot/install.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=60
+ExecStart=/usr/bin/modprobe xe
+
+[Install]
+WantedBy=multi-user.target

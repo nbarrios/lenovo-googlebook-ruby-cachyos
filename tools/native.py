@@ -13,7 +13,7 @@ import subprocess
 import sys
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lapis.common import ROOT, KERNEL_RELEASE, KERNEL_SHA256, XE_PARAMETERS, output, read_json, require, run, save_json, sha256
+from lapis.common import ROOT, KERNEL_RELEASE, KERNEL_SHA256, XE_PARAMETERS, board, output, read_json, require, run, save_json, sha256
 from lapis.gpt import read_gpt
 from lapis.boot import build_set
 
@@ -26,8 +26,8 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def validate_profile(gpt):
-    profile = read_json(ROOT / 'assets/lapis-512gb.json')
+def validate_profile(gpt, profile_name):
+    profile = read_json(ROOT / 'assets' / profile_name)
     require(gpt.disk_bytes == profile['disk_bytes'], 'Only the tested 512 GB layout is supported')
     actual = [{k: p[k] for k in ('index', 'name', 'start_lba', 'size', 'type_guid')} for p in gpt.partitions()]
     require(actual == profile['partitions'], 'Factory partition layout differs; stop and report sanitized geometry')
@@ -38,10 +38,7 @@ def validate_profile(gpt):
 
 def hardware(device, *, ac=False):
     require(os.geteuid() == 0 and sys.platform == 'linux', 'Run as root on the live Googlebook')
-    require(Path('/sys/class/dmi/id/sys_vendor').read_text().strip() == 'Google', 'Wrong DMI vendor')
-    require(Path('/sys/class/dmi/id/product_name').read_text().strip() == 'Lapis', 'Wrong board')
-    require(Path('/sys/bus/pci/devices/0000:00:02.0/device').read_text().strip() == '0xb090', 'Wrong graphics device')
-    require(Path('/sys/bus/pci/devices/0000:00:1f.3/subsystem_device').read_text().strip() == '0x15e4', 'Wrong audio subsystem')
+    _, facts = board()
     require(output(['uname', '-r']) == KERNEL_RELEASE, 'Wrong live kernel')
     require(output(['findmnt', '-no', 'FSTYPE', '/']) == 'overlay', 'Boot the live USB first')
     require('archisobasedir=arch' in Path('/proc/cmdline').read_text(), 'Not an Arch ISO live boot')
@@ -56,7 +53,7 @@ def hardware(device, *, ac=False):
     size = int(output(['blockdev', '--getsize64', device]))
     with device.open('rb') as f:
         gpt = read_gpt(f, size)
-    validate_profile(gpt)
+    validate_profile(gpt, facts['profile'])
     return gpt
 
 
@@ -206,13 +203,18 @@ def build(args):
     checked_backup(device)
     mounted()
     require((STATE / 'configured.json').is_file(), 'Configure target first')
+    configured = read_json(STATE / 'configured.json')
+    # CachyOS records its own kernel; the Omarchy path uses the pinned ISO kernel.
+    kernel = TARGET / configured.get('kernel', '/boot/vmlinuz-linux-t2').lstrip('/')
+    initramfs = TARGET / configured.get('initramfs', '/boot/initramfs-linux-t2.img').lstrip('/')
+    kernel_sha256 = configured.get('kernel_sha256', KERNEL_SHA256)
     cmdline = (f"cryptdevice=UUID={p['luks_uuid']}:omarchy_root root=/dev/mapper/omarchy_root rootfstype=btrfs rootflags=subvol=@ rw "
                'zswap.enabled=0 modprobe.blacklist=xe initramfs_async=0 console=tty0 loglevel=3 log_buf_len=4M '
                'printk.time=1 panic=30 fbcon=nodefer plymouth.enable=0 rd.plymouth=0 ' +
                ' '.join('xe.' + k + '=' + v for k, v in XE_PARAMETERS.items()))
-    require((TARGET / 'boot/initramfs-linux-t2.img').stat().st_size < 29 * 1024**2, 'Initramfs too large')
-    build_set(TARGET / 'boot/vmlinuz-linux-t2', TARGET / 'boot/initramfs-linux-t2.img', cmdline,
-              STATE / 'candidate', ROOT / 'vendor', sizes={p['name']: p['size'] for p in gpt.partitions()}, installed=True)
+    require(initramfs.stat().st_size < 29 * 1024**2, 'Initramfs too large')
+    build_set(kernel, initramfs, cmdline, STATE / 'candidate', ROOT / 'vendor',
+              sizes={p['name']: p['size'] for p in gpt.partitions()}, installed=True, kernel_sha256=kernel_sha256)
     (TARGET / 'etc/kernel').mkdir(exist_ok=True)
     (TARGET / 'etc/kernel/cmdline').write_text(cmdline + '\n')
     shutil.copy2(STATE / 'candidate/avb-private.pem', TARGET / 'etc/asus-boot/avb-private.pem')

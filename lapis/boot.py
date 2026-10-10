@@ -17,14 +17,14 @@ def make_key(path):
     require(path.stat().st_mode & 0o077 == 0, 'AVB private key must be mode 600')
 
 
-def build_set(kernel, initrd, cmdline, destination, vendor, *, sizes=None, installed=False):
+def build_set(kernel, initrd, cmdline, destination, vendor, *, sizes=None, installed=False, kernel_sha256=KERNEL_SHA256):
     """Installed initrd goes in vendor_boot (32 MiB); live initrd in init_boot."""
     dest, vendor = Path(destination), Path(vendor)
     require(not dest.exists(), 'Boot output directory already exists')
     dest.mkdir(parents=True, mode=0o700)
     for path in (kernel, initrd):
         require_regular(path)
-    require(sha256(kernel) == KERNEL_SHA256, 'Kernel differs from the hardware-tested version')
+    require(sha256(kernel) == kernel_sha256, 'Kernel differs from the expected version')
     require(len(cmdline.encode()) < 1536 and '\n' not in cmdline, 'Invalid kernel command line')
     mk, avb = vendor / 'mkbootimg/mkbootimg.py', vendor / 'avb/avbtool.py'
     require(mk.is_file() and avb.is_file(), 'Run tools/fetch_sources.py first')

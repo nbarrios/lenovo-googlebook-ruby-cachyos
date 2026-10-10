@@ -90,7 +90,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_profile_rejects_unrecognized_disk(self):
         data = disk_fixture()
-        with self.assertRaises(RuntimeError): native.validate_profile(read_gpt(io.BytesIO(data), len(data)))
+        with self.assertRaises(RuntimeError): native.validate_profile(read_gpt(io.BytesIO(data), len(data)), 'lapis-512gb.json')
 
     def test_short_writes_are_completed(self):
         class ShortWriter(io.BytesIO):

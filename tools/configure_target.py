@@ -9,7 +9,7 @@ import re
 import shutil
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lapis.common import ROOT, KERNEL_PACKAGES, KERNEL_RELEASE, KERNEL_SHA256, output, read_json, require, run, save_json, sha256
+from lapis.common import ROOT, KERNEL_PACKAGES, KERNEL_RELEASE, KERNEL_SHA256, board, output, read_json, require, run, save_json, sha256
 from tools.native import STATE, TARGET, current, mounted, checked_backup
 
 MASKED_HOOKS = ['60-mkinitcpio-remove.hook', '60-limine-mkinitcpio-remove-pre.hook',
@@ -40,6 +40,7 @@ def chroot(*argv, **kw):
 
 def packages(args):
     current(); mounted()
+    require(board()[0] == 'Lapis', 'Omarchy target is Lapis-only; use tools/configure_cachyos.py on Ruby')
     require(sys.stdin.isatty(), 'Package setup needs a local terminal for the private account-password prompt')
     require(not (STATE / 'packages-started').exists(), 'Packages already attempted; inspect failure before manual resumption')
     require(re.fullmatch('[a-z][a-z0-9_-]{0,30}', args.user) and args.user not in ('root', 'asuslive'), 'Invalid username')

@@ -18,12 +18,35 @@ XE_PARAMETERS = {
     'gsc_firmware_path': '', 'enable_panel_replay': '0', 'enable_psr': '0',
     'enable_fbc': '0', 'enable_dsb': '0', 'enable_sagv': '0', 'enable_dc': '0',
 }
+# Physically surveyed fatcat boards. Ruby (Lenovo Googlebook 15) has a GPT
+# byte-identical to the Lapis 512 GB profile; one plain Xe load drives its panel.
+BOARDS = {
+    'Lapis': dict(gpu='0xb090', audio_subsystem='0x15e4', profile='lapis-512gb.json', xe_reload=True),
+    'Ruby': dict(gpu='0xb090', audio_subsystem='0x0000', profile='lapis-512gb.json', xe_reload=False),
+}
+# CachyOS target (Ruby). The kernel is pinned by the installed system; its hash
+# is recorded at install time rather than shipped, because CachyOS repos only
+# carry the current build.
+CACHYOS_KEY = '882DCFE48E2051D48E2562ABF3B607488DB35A47'
+CACHYOS_KERNEL = '/boot/vmlinuz-linux-cachyos'
+CACHYOS_INITRAMFS = '/boot/initramfs-linux-cachyos-android.img'
 
 
 def require(condition, message):
     # Never use assert for a guard: Python -O must not disable it.
     if not condition:
         raise RuntimeError(message)
+
+
+def board():
+    """Return (name, facts) for the running board, refusing unsurveyed hardware."""
+    name = Path('/sys/class/dmi/id/product_name').read_text().strip()
+    require(Path('/sys/class/dmi/id/sys_vendor').read_text().strip() == 'Google', 'Wrong DMI vendor')
+    require(name in BOARDS, 'Unsupported board: ' + name)
+    facts = BOARDS[name]
+    require(Path('/sys/bus/pci/devices/0000:00:02.0/device').read_text().strip() == facts['gpu'], 'Wrong graphics device')
+    require(Path('/sys/bus/pci/devices/0000:00:1f.3/subsystem_device').read_text().strip() == facts['audio_subsystem'], 'Wrong audio subsystem')
+    return name, facts
 
 
 def sha256(path):
