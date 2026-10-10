@@ -17,7 +17,8 @@ def make_key(path):
     require(path.stat().st_mode & 0o077 == 0, 'AVB private key must be mode 600')
 
 
-def build_set(kernel, initrd, cmdline, destination, vendor, *, sizes=None, installed=False, kernel_sha256=KERNEL_SHA256):
+def build_set(kernel, initrd, cmdline, destination, vendor, *, sizes=None, installed=False, kernel_sha256=KERNEL_SHA256,
+              key=None):
     """Installed initrd goes in vendor_boot (32 MiB); live initrd in init_boot."""
     dest, vendor = Path(destination), Path(vendor)
     require(not dest.exists(), 'Boot output directory already exists')
@@ -28,6 +29,12 @@ def build_set(kernel, initrd, cmdline, destination, vendor, *, sizes=None, insta
     require(len(cmdline.encode()) < 1536 and '\n' not in cmdline, 'Invalid kernel command line')
     mk, avb = vendor / 'mkbootimg/mkbootimg.py', vendor / 'avb/avbtool.py'
     require(mk.is_file() and avb.is_file(), 'Run tools/fetch_sources.py first')
+    if key is not None:
+        # Reuse the device's existing AVB key (kernel updates) instead of a new one.
+        require_regular(key)
+        fd = os.open(dest / 'avb-private.pem', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(Path(key).read_bytes())
     key = dest / 'avb-private.pem'
     make_key(key)
     run(['openssl', 'rsa', '-in', key, '-pubout', '-out', dest / 'avb-public.pem'])

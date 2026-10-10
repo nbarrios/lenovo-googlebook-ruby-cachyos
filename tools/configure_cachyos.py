@@ -12,6 +12,7 @@ from lapis.common import (ROOT, CACHYOS_INITRAMFS, CACHYOS_KERNEL, CACHYOS_KEY, 
                           read_json, require, run, save_json, sha256)
 from tools.native import STATE, TARGET, current, mounted, checked_backup
 from tools.configure_target import put, mask, chroot
+from tools.kernel_update import GUARD as KERNEL_GUARD
 
 # Panther Lake has AVX2 but no AVX-512: x86-64-v3 builds.
 CACHYOS_SERVERS = ['https://cdn77.cachyos.org/repo/{arch}/$repo', 'https://us.cachyos.org/repo/{arch}/$repo']
@@ -134,7 +135,7 @@ def configure(args):
     # Kernel pin: the running kernel lives in signed Android partitions, not /boot.
     conf = pacman_conf(live=False).replace('[options]\n', '[options]\nIgnorePkg = ' + ' '.join(KERNEL_PKGS) + '\n', 1)
     put('/etc/pacman.conf', conf)
-    put('/usr/local/libexec/asus-boot-update-guard', '#!/bin/sh\necho "Kernel update blocked: rebuild and validate Android boot images first." >&2\nexit 1\n', 0o755)
+    put('/usr/local/libexec/asus-boot-update-guard', KERNEL_GUARD, 0o755)
     put('/etc/pacman.d/hooks/00-asus-kernel-guard.hook', '[Trigger]\nOperation = Upgrade\nOperation = Install\nOperation = Remove\nType = Path\nTarget = usr/lib/modules/*/vmlinuz\n[Action]\nDescription = Protect kernel and Android boot pair\nWhen = PreTransaction\nExec = /usr/local/libexec/asus-boot-update-guard\nAbortOnFail\n')
     put('/etc/asus-boot/mkinitcpio.conf', (ROOT / 'assets/installed/mkinitcpio.conf').read_text())
     save_json(TARGET / 'etc/asus-boot/install.json', p)

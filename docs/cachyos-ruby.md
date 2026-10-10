@@ -96,3 +96,23 @@ The script reads Lenovo's `tas2563RCA4.bin` and `tas2563_coef.bin` from the unto
 Factory per-speaker calibration lives in coreboot VPD (`dsm_calib_register_array`, `dsm_calib_value_0..3`), not on the erased disk. `ruby-speaker-calibration.service` writes it to the driver's write-only `Speaker Calibrated Data` control at boot.
 
 Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby module (`intel/sof-ipc4/ptl/ruby/sof-ptl.ri`, 2.14.1008.1) and a topology with `dolby-dax` pipelines. `ruby-dax.conf` points `snd_sof_pci` at them, as Googlebook OS's `mod_options --sof-fw` does, and a conditional UCM BootSequence block loads `dax_param.bin` and the factory switch/profile values. Remove `/etc/modprobe.d/ruby-dax.conf` to return to the stock sof-firmware files; the UCM block then skips itself. Toggle live with `amixer -c sofrt5682 cset name='DAX Speaker Switch' on|off`.
+
+## Kernel updates
+
+`linux-cachyos` is pinned (`IgnorePkg`), and a pacman hook blocks any change to `usr/lib/modules/*/vmlinuz` unless `tools/kernel_update.py` holds its one-time pass. Update in two steps, rebooting between them:
+
+```sh
+sudo pacman -Syu                                   # everything except the kernel
+sudo ~/googlebook-ruby/tools/kernel_update.py prepare
+sudo ~/googlebook-ruby/tools/kernel_update.py commit
+systemctl reboot                                   # unlock, log in
+sudo ~/googlebook-ruby/tools/kernel_update.py confirm
+```
+
+`prepare` keeps a reflinked copy of the running kernel's modules, installs the new kernel, restores the old modules so the running system and any rollback keep working, builds the small encrypted-root initramfs, signs the four slot-A images with the device's AVB key (`/etc/asus-boot/avb-private.pem`), and validates them with the ChromiumOS Android loader against the live partition table. It writes nothing to the boot partitions.
+
+`commit` backs up the current slot-A images under `/var/lib/asus-boot/kernel-update/slots/`, writes the validated set with read-back, and restores every attempted region on a write error. `confirm` (on the new kernel) drops the preserved modules and keeps the two newest backups.
+
+If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition as `omarchy_root`, mount subvolume `@` on `/mnt`, then run `kernel_update.py rollback --root /mnt` from the kit. From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`.
+
+The build and loader-validation pipeline was exercised on the device with 7.2.9-1-cachyos and the device GPT; a physical kernel upgrade has not yet been performed.
