@@ -31,8 +31,12 @@ require(os.geteuid() == 0, 'Live hardware/environment prerequisite failed')
 require(output(['findmnt', '-no', 'FSTYPE', '/']) == 'overlay', 'Live hardware/environment prerequisite failed')
 require(output(['findmnt', '-no', 'FSTYPE', '/run/archiso/cowspace']) == 'tmpfs', 'Live hardware/environment prerequisite failed')
 require('archisobasedir=arch' in Path('/proc/cmdline').read_text().split(), 'Live hardware/environment prerequisite failed')
-require(Path('/sys/class/dmi/id/product_name').read_text().strip() == 'Lapis', 'Live hardware/environment prerequisite failed')
-require(Path('/sys/bus/pci/devices/0000:00:02.0/device').read_text().strip() == '0xb090', 'Live hardware/environment prerequisite failed')
+# RAM-only stage: other fatcat boards (e.g. Lenovo "Ruby") may run the live test.
+# The native installer keeps its strict Lapis checks.
+board = Path('/sys/class/dmi/id/product_name').read_text().strip()
+gpu = Path('/sys/bus/pci/devices/0000:00:02.0/device').read_text().strip()
+if (board, gpu) != ('Lapis', '0xb090'):
+    print(f'NOTE: untested board {board!r}, GPU {gpu!r}; continuing live-only test', flush=True)
 require(output(['uname', '-r']) == '7.2.4-arch1-Watanare-T2-3-t2', 'Live hardware/environment prerequisite failed')
 require(not any(('/dev/nvme' in line for line in Path('/proc/mounts').read_text().splitlines())), 'Live hardware/environment prerequisite failed')
 assets = Path('/opt/asus-googlebook-omarchy/assets/live')
@@ -90,6 +94,10 @@ for name in ('hyprland.lua', 'live-bashrc'):
     shutil.chown(home / name, user=user.pw_uid, group=user.pw_gid)
 run(['runuser', '-u', 'asuslive', '--', 'Hyprland', '--verify-config', '--config', str(home / 'hyprland.lua')])
 
+if not Path('/sys/module/xe').exists() and board != 'Lapis':
+    # Ruby: a single Xe load handed the panel over cleanly in a console test.
+    run(['modprobe', 'xe'] + [f'{k}={v}' for k, v in params.items()], timeout=40)
+    print('XE_LOADED: single load, no reload on this board', flush=True)
 if not Path('/sys/module/xe').exists():
     run(['modprobe', 'xe'] + [f'{k}={v}' for k, v in params.items()], timeout=40)
     # The first firmware-to-Xe display handoff failed in two physical boots.

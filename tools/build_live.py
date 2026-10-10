@@ -61,6 +61,8 @@ def main():
     p.add_argument('--iso', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--vendor', type=Path, default=ROOT / 'vendor')
+    p.add_argument('--console-only', action='store_true',
+                   help='Skip the Xe reload and live desktop; keep the firmware framebuffer console')
     args = p.parse_args()
     iso = args.iso.resolve()
     require(iso.is_file(), 'Missing ISO')
@@ -78,7 +80,8 @@ def main():
     cmdline = (f'archisobasedir=arch archisodevice=/dev/disk/by-partuuid/{iso_part} '
                'modprobe.blacklist=xe initramfs_async=0 console=tty0 loglevel=4 '
                'log_buf_len=4M printk.time=1 panic=30 fbcon=nodefer disablehooks=plymouth '
-               'plymouth.enable=0 rd.plymouth=0 cow_spacesize=3G asus.live_desktop=1 ' +
+               'plymouth.enable=0 rd.plymouth=0 cow_spacesize=3G ' +
+               ('' if args.console_only else 'asus.live_desktop=1 ') +
                ' '.join('xe.' + k + '=' + v for k, v in XE_PARAMETERS.items()))
     initrd = (work / 'initramfs-linux-t2.img').read_bytes()
     config = find_member(initrd, 'config', lambda data: subprocess.check_output(['zstd', '-d', '-c'], input=data)).decode()
