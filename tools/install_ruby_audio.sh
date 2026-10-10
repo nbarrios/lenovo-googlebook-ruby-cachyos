@@ -23,8 +23,16 @@ for f in tas2563RCA4.bin tas2563_coef.bin; do
     [ -s "$work/vendor/firmware/$f" ] || { echo "Factory image lacks $f" >&2; exit 1; }
     install -Dm644 "$work/vendor/firmware/$f" "/usr/lib/firmware/updates/$f"
 done
+# Factory Ruby SOF firmware with Dolby DAX, its topology, and the DAX tuning.
+for f in intel/sof-ipc4/ptl/ruby/sof-ptl.ri intel/sof-ipc4/ptl/ruby/sof-ptl-openmodules.ri \
+         intel/sof-ipc4-tplg/ruby/sof-ptl-tas2563-rt5682.tplg; do
+    [ -s "$work/vendor/firmware/$f" ] || { echo "Factory image lacks $f" >&2; exit 1; }
+    install -Dm644 "$work/vendor/firmware/$f" "/usr/lib/firmware/updates/$f"
+done
+install -Dm644 "$work/vendor/etc/audio/dax/ruby/dax_param.bin" /usr/lib/firmware/updates/intel/sof-ipc4-tplg/ruby/dax_param.bin
 
 install -Dm644 "$assets/ruby-audio.conf" /etc/modprobe.d/ruby-audio.conf
+install -Dm644 "$assets/ruby-dax.conf" /etc/modprobe.d/ruby-dax.conf
 install -Dm644 "$assets/ruby-gpu.service" /etc/systemd/system/ruby-gpu.service
 install -Dm644 "$assets/ucm2/sof-rt5682/sof-rt5682.conf" /usr/share/alsa/ucm2/conf.d/sof-rt5682/sof-rt5682.conf
 install -Dm644 "$assets/ucm2/sof-rt5682/HiFi.conf" /usr/share/alsa/ucm2/conf.d/sof-rt5682/HiFi.conf
