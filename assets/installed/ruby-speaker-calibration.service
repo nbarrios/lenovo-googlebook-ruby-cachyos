@@ -1,0 +1,16 @@
+[Unit]
+Description=Load factory TAS2563 speaker calibration from coreboot VPD
+# The calibration control appears once SOF (loaded by ruby-gpu.service) and the
+# amplifier firmware are up; the script waits for it. It must run before the
+# first playback, when the amplifiers load their playback configuration.
+After=ruby-gpu.service sound.target
+Before=greetd.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/modprobe vpd_sysfs
+ExecStart=/usr/local/libexec/ruby-speaker-calibration
+
+[Install]
+WantedBy=multi-user.target
