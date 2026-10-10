@@ -12,6 +12,9 @@ Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=60
 ExecStart=/usr/bin/modprobe xe
+# SOF (RT5682S + TAS2563 on I2S) binds after Xe so the HDMI audio component is
+# available; it is soft-blacklisted in /etc/modprobe.d/ruby-audio.conf.
+ExecStartPost=-/usr/bin/modprobe snd_sof_pci_intel_ptl
 
 [Install]
 WantedBy=multi-user.target

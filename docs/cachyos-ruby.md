@@ -11,8 +11,8 @@ Experimental port of the Lapis procedure to the Lenovo Googlebook 15 (DMI `Googl
 | Graphics | Same `0xb090` device. **One plain Xe load** hands the panel over cleanly; the Lapis unload/reload is not used |
 | Hyprland live desktop, keyboard, ELAN touchpad, Goodix touchscreen | Work |
 | Wi-Fi | Intel CNVi `8086:e440`, firmware loads |
-| Audio | Different from Lapis: Realtek RT5682 headset codec + TI TAS2563 amplifiers (I2S). Not yet configured |
-| CachyOS internal install | **Not yet performed** |
+| Audio | RT5682S headset codec + 4x TI TAS2563 amplifiers on I2S, SOF topology `sof-ptl-tas2563-rt5682.tplg`. Speakers verified 10 October 2026; headphones/mics enumerate |
+| CachyOS internal install | Completed and booted from internal disk, 10 October 2026 |
 
 ## Differences from the Lapis/Omarchy install
 
@@ -80,3 +80,17 @@ sudo pacman -S niri noctalia noctalia-greeter xwayland-satellite
 ```
 
 The mapper name `omarchy_root` and filesystem label are kept from the upstream tooling.
+
+## Audio
+
+`dspcfg` auto-detection picks legacy HDA (HDMI only), the TAS2563 tuning firmware is not in linux-firmware, and alsa-ucm-conf has no `sof-rt5682` profile. After the first boot:
+
+```sh
+sudo pacman -S --needed alsa-utils android-tools erofs-utils
+sudo ~/googlebook-ruby/tools/install_ruby_audio.sh   # or /opt/lapis-kit/tools/...
+systemctl reboot
+```
+
+The script reads Lenovo's `tas2563RCA4.bin` and `tas2563_coef.bin` from the untouched factory `super` partition (`vendor_a`) into `/usr/lib/firmware/updates`, forces SOF (`ruby-audio.conf`), loads SOF after Xe (`ruby-gpu.service`), and installs a UCM profile converted from the factory CRAS config. The UCM Speaker sequence selects TAS2563 DSP configuration 0; the driver otherwise starts with configuration -1 and the amplifiers stay silent.
+
+Per-speaker calibration (`tas2563_cal_0x4c`…`0x4f.bin`) was stored by Googlebook OS on the erased userdata partition. The amplifiers run with default protection parameters: keep volume moderate until calibration is regenerated.
