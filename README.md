@@ -18,7 +18,9 @@ An experimental route to native **CachyOS on the Lenovo Googlebook 15 (Google Ru
 | Headphones and microphones | Headset auto-switch; internal mics with a +36 dB PipeWire boost |
 | Fingerprint reader | USB FPMCU via an out-of-tree `cros_ec_usb` DKMS driver and a patched libfprint; works for `sudo` and the Noctalia lock screen |
 | Kernel updates | `pacman -Syu` stages and validates the new signed boot images; one command writes them |
-| Not tested | Suspend/resume, camera, Bluetooth, battery life, external displays beyond a basic dock |
+| Suspend | s2idle reaches S0ix; about 0.35 %/hour overnight; power key and lid suspend |
+| Camera and Bluetooth | UVC camera; Bluetooth audio with AAC and headset microphone |
+| Not tested | External displays beyond a basic dock, USB-C hotplug after resume |
 
 ## Start here
 
