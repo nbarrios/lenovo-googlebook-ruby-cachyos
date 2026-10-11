@@ -21,9 +21,13 @@ XE_PARAMETERS = {
 # Physically surveyed fatcat boards. Ruby (Lenovo Googlebook 15) has a GPT
 # byte-identical to the Lapis 512 GB profile; one plain Xe load drives its panel.
 BOARDS = {
-    'Lapis': dict(gpu='0xb090', audio_subsystem='0x15e4', profile='lapis-512gb.json', xe_reload=True),
-    'Ruby': dict(gpu='0xb090', audio_subsystem='0x0000', profile='lapis-512gb.json', xe_reload=False),
+    'Lapis': dict(gpu='0xb090', audio_subsystem='0x15e4', profile='lapis-512gb.json', xe_reload=True,
+                  mapper='omarchy_root', label='Omarchy'),
+    'Ruby': dict(gpu='0xb090', audio_subsystem='0x0000', profile='lapis-512gb.json', xe_reload=False,
+                 mapper='cachyos-root', label='CachyOS'),
 }
+# Ruby systems installed before the rename still open the disk as omarchy_root.
+ROOT_MAPPERS = ('cachyos-root', 'omarchy_root')
 # CachyOS target (Ruby). The kernel is pinned by the installed system; its hash
 # is recorded at install time rather than shipped, because CachyOS repos only
 # carry the current build.

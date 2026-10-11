@@ -157,7 +157,9 @@ def format_root(args):
     require(not list((Path('/sys/class/block') / block.resolve().name / 'holders').iterdir()), 'Userdata has active holders')
     mounted = output(['lsblk', '-n', '-r', '-o', 'MOUNTPOINTS', device])
     require(not mounted, 'An internal partition is mounted')
-    require(not Path('/dev/mapper/omarchy_root').exists(), 'Root mapper already exists')
+    _, facts = board()
+    mapper = '/dev/mapper/' + facts['mapper']
+    require(not Path(mapper).exists(), 'Root mapper already exists')
     require(subprocess.run(['mountpoint', '-q', TARGET]).returncode != 0, '/mnt already mounted')
     print('Will erase ONLY userdata:', block, part['size'], 'bytes; create LUKS2 and Btrfs.')
     if not args.apply:
@@ -169,24 +171,24 @@ def format_root(args):
     (STATE / 'format-started').touch(mode=0o600)
     secret = password.encode()
     run(['cryptsetup', 'luksFormat', '--type', 'luks2', '--batch-mode', '--uuid', p['luks_uuid'],
-         '--label', 'OMARCHY', '--cipher', 'aes-xts-plain64', '--key-size', '512', '--pbkdf', 'argon2id',
+         '--label', facts['label'].upper(), '--cipher', 'aes-xts-plain64', '--key-size', '512', '--pbkdf', 'argon2id',
          '--pbkdf-memory', '1048576', '--iter-time', '2000', '--key-file', '-', block], input=secret)
-    run(['cryptsetup', 'open', '--key-file', '-', block, 'omarchy_root'], input=secret)
+    run(['cryptsetup', 'open', '--key-file', '-', block, facts['mapper']], input=secret)
     del secret, password
     run(['cryptsetup', 'luksHeaderBackup', block, '--header-backup-file', dest / 'luks-header.bin'])
     (dest / 'luks-header.bin').chmod(0o600)
-    run(['mkfs.btrfs', '-f', '-L', 'Omarchy', '/dev/mapper/omarchy_root'])
+    run(['mkfs.btrfs', '-f', '-L', facts['label'], mapper])
     TARGET.mkdir(exist_ok=True)
-    run(['mount', '/dev/mapper/omarchy_root', TARGET])
+    run(['mount', mapper, TARGET])
     for name in ('@', '@home', '@log', '@pkg'):
         run(['btrfs', 'subvolume', 'create', TARGET / name])
     run(['umount', TARGET])
-    run(['mount', '-o', 'noatime,compress=zstd:3,subvol=@', '/dev/mapper/omarchy_root', TARGET])
+    run(['mount', '-o', 'noatime,compress=zstd:3,subvol=@', mapper, TARGET])
     for subvol, relative in [('@home', 'home'), ('@log', 'var/log'), ('@pkg', 'var/cache/pacman/pkg')]:
         folder = TARGET / relative
         folder.mkdir(parents=True, exist_ok=True)
-        run(['mount', '-o', 'noatime,compress=zstd:3,subvol=' + subvol, '/dev/mapper/omarchy_root', folder])
-    save_json(STATE / 'format.json', dict(btrfs_uuid=output(['blkid', '-s', 'UUID', '-o', 'value', '/dev/mapper/omarchy_root'])))
+        run(['mount', '-o', 'noatime,compress=zstd:3,subvol=' + subvol, mapper, folder])
+    save_json(STATE / 'format.json', dict(btrfs_uuid=output(['blkid', '-s', 'UUID', '-o', 'value', mapper])))
     os.sync()
     print('Encrypted filesystem mounted. Backup LUKS header is on the external drive.')
 
@@ -194,7 +196,8 @@ def format_root(args):
 def mounted():
     require((STATE / 'format.json').is_file(), 'Complete the format stage first')
     require(output(['findmnt', '-no', 'FSTYPE', '--mountpoint', TARGET]) == 'btrfs', 'Target not mounted')
-    require(output(['findmnt', '-no', 'SOURCE', '--mountpoint', TARGET]).startswith('/dev/mapper/omarchy_root['), 'Wrong mounted target')
+    mapper = '/dev/mapper/' + board()[1]['mapper']
+    require(output(['findmnt', '-no', 'SOURCE', '--mountpoint', TARGET]).startswith(mapper + '['), 'Wrong mounted target')
     require(output(['cryptsetup', 'luksUUID', str(read_json(STATE / 'plan.json')['device']) + 'p1']) == read_json(STATE / 'plan.json')['luks_uuid'], 'LUKS identity changed')
 
 
@@ -211,7 +214,8 @@ def build(args):
     # CachyOS sets the Xe feature switches in /etc/modprobe.d/ruby-xe.conf so they
     # can change without rebuilding the boot set; the command line would override it.
     xe = XE_PARAMETERS if 'kernel' not in configured else {'gsc_firmware_path': ''}
-    cmdline = (f"cryptdevice=UUID={p['luks_uuid']}:omarchy_root root=/dev/mapper/omarchy_root rootfstype=btrfs rootflags=subvol=@ rw "
+    mapper = board()[1]['mapper']
+    cmdline = (f"cryptdevice=UUID={p['luks_uuid']}:{mapper} root=/dev/mapper/{mapper} rootfstype=btrfs rootflags=subvol=@ rw "
                'zswap.enabled=0 modprobe.blacklist=xe initramfs_async=0 console=tty0 loglevel=3 log_buf_len=4M '
                'printk.time=1 panic=30 fbcon=nodefer plymouth.enable=0 rd.plymouth=0 ' +
                ' '.join('xe.' + k + '=' + v for k, v in xe.items()))

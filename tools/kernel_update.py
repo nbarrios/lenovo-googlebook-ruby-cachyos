@@ -31,7 +31,7 @@ import subprocess
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lapis.boot import build_set
-from lapis.common import (ROOT, CACHYOS_INITRAMFS, CACHYOS_KERNEL, board, output, read_json, require, run,
+from lapis.common import (ROOT, ROOT_MAPPERS, CACHYOS_INITRAMFS, CACHYOS_KERNEL, board, output, read_json, require, run,
                           save_json, sha256)
 from lapis.gpt import read_gpt
 from tools.native import write_all
@@ -221,7 +221,8 @@ def check_initramfs(path):
 def installed_system(power=False):
     require(os.geteuid() == 0, 'Run as root')
     require(board()[0] == 'Ruby', 'Not a Ruby board')
-    require(output(['findmnt', '-no', 'SOURCE', '/']).startswith('/dev/mapper/omarchy_root'), 'Run on the installed system')
+    require(output(['findmnt', '-no', 'SOURCE', '/']).startswith(tuple('/dev/mapper/' + m for m in ROOT_MAPPERS)),
+            'Run on the installed system')
     if power:
         supplies = Path('/sys/class/power_supply').glob('*/online')
         require(any(p.read_text().strip() == '1' for p in supplies), 'Connect AC power')

@@ -60,7 +60,7 @@ python3 tools/native.py validate --loader /mnt/opt/lapis-kit/build/load_android_
 # 5. Commit (dry run, then apply)
 python3 tools/native.py commit
 python3 tools/native.py commit --apply
-sync; umount -R /mnt; cryptsetup close omarchy_root; poweroff
+sync; umount -R /mnt; cryptsetup close cachyos-root; poweroff
 ```
 
 `plan` must pass before anything else. It also checks that slot A is the preferred successful slot and that the original `pvmfw_a/b` labels are present. Any failure is a stop condition.
@@ -70,7 +70,7 @@ sync; umount -R /mnt; cryptsetup close omarchy_root; poweroff
 Remove the USB drives. Choose **Boot from internal disk**, type the disk password at the text prompt, then log in.
 
 ```sh
-findmnt /                         # btrfs on /dev/mapper/omarchy_root
+findmnt /                         # btrfs on /dev/mapper/cachyos-root
 uname -r                          # the pinned *-cachyos release
 systemctl status ruby-gpu.service
 systemctl --failed
@@ -79,7 +79,7 @@ sudo pacman -Syu                  # a kernel upgrade is staged, not written
 sudo pacman -S niri noctalia noctalia-greeter xwayland-satellite
 ```
 
-The mapper name `omarchy_root` and filesystem label are kept from the upstream tooling.
+On Ruby the LUKS mapper is `cachyos-root`, the LUKS label `CACHYOS` and the Btrfs label `CachyOS`; the Omarchy path on Lapis keeps `omarchy_root`. Systems installed before 11 October 2026 use `omarchy_root`; see [Renaming the root mapper](#renaming-the-root-mapper).
 
 ## Audio
 
@@ -264,7 +264,7 @@ Two pacman hooks, triggered by any change to `usr/lib/modules/*/vmlinuz`, run `/
 
 `commit` backs up the current slot-A images under `/var/lib/asus-boot/kernel-update/slots/`, writes the validated set with read-back, and restores every attempted region on a write error. `asus-kernel-confirm.timer` runs `confirm --auto` ten minutes after boot; it acts only when the state is `committed` and `uname -r` is the new kernel, then drops the preserved modules and keeps the two newest backups. Run `confirm` by hand to do it sooner.
 
-If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition as `omarchy_root`, mount subvolume `@` on `/mnt`, then run `python3 /mnt/opt/lapis-kit/tools/kernel_update.py rollback --root /mnt` (typed confirmation). From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`; `prepare` alone runs `pacman -S linux-cachyos linux-cachyos-headers` and lets the hooks stage it. Running `prepare`, `commit` or `install-hooks` from a checkout first copies its `lapis/` and `tools/` to `/opt/lapis-kit`, so the hooks and the rescue copy match the code you ran.
+If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition (any mapper name works, for example `cachyos-root`), mount subvolume `@` on `/mnt`, then run `python3 /mnt/opt/lapis-kit/tools/kernel_update.py rollback --root /mnt` (typed confirmation). From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`; `prepare` alone runs `pacman -S linux-cachyos linux-cachyos-headers` and lets the hooks stage it. Running `prepare`, `commit` or `install-hooks` from a checkout first copies its `lapis/` and `tools/` to `/opt/lapis-kit`, so the hooks and the rescue copy match the code you ran.
 
 ### Migrating from the pinned kernel
 
@@ -277,3 +277,17 @@ sudo ~/googlebook-ruby/tools/kernel_update.py install-hooks
 It refreshes `/opt/lapis-kit/{lapis,tools}` as root-owned copies, writes both hooks and the confirm service and timer, removes `00-asus-kernel-guard.hook` and `/usr/local/libexec/asus-boot-update-guard`, and removes only `linux-cachyos` and `linux-cachyos-headers` from `IgnorePkg` in `/etc/pacman.conf`, keeping a backup at `/etc/pacman.conf.kernel-pin.bak`.
 
 First physical upgrade, 7.2.9-1 to 7.2.9-2-cachyos, completed on 10 October 2026: prepare, commit, reboot and confirm, with audio, Xe and speaker calibration working afterwards.
+
+### Renaming the root mapper
+
+Systems installed before 11 October 2026 open the disk as `omarchy_root`, with the labels `OMARCHY` and `Omarchy`. The tools accept either mapper name. To switch to `cachyos-root`, run from the checkout with no update pending. Only `/etc/kernel/cmdline` names the mapper (the `encrypt` hook reads it from `cryptdevice=`), and `fstab` mounts by UUID, so a rebuilt boot set is all that is needed. The labels are cosmetic and can be changed online.
+
+```sh
+sudo sed -i 's/omarchy_root/cachyos-root/g' /etc/kernel/cmdline
+sudo cryptsetup config --label CACHYOS /dev/disk/by-partlabel/userdata
+sudo btrfs filesystem label / CachyOS
+sudo ~/googlebook-ruby/tools/kernel_update.py prepare --no-upgrade
+sudo /opt/lapis-kit/tools/kernel_update.py commit
+```
+
+Reboot, type the disk password, and check that `findmnt /` shows `/dev/mapper/cachyos-root`. The confirm timer then settles the update as usual.
