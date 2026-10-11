@@ -13,6 +13,8 @@ The build downloads pinned **source code** from these projects. They retain thei
 | Firmware loader validator | [ChromiumOS vboot_reference](https://chromium.googlesource.com/chromiumos/platform/vboot_reference/) | BSD-style and upstream component notices |
 | OS and applications, obtained separately | [Omarchy](https://github.com/omacom/omarchy), [Arch Linux](https://archlinux.org/) | Each package's license |
 
+`assets/installed/cros-ec-usb/` is Linux kernel code under GPL-2.0, not MIT: Google's `cros_ec_usb.c` as posted to LKML (v6, unmodified), `cros_ec.h` from Linux v7.2 (unmodified), a Kbuild `Makefile`, and two patches that DKMS applies at build time for the fingerprint reader. Provenance and checksums are in its `dkms.conf`.
+
 `tools/loader_harness.c` is a modified ChromiumOS test utility, governed by `tools/LICENSE.chromium`. It is a host simulation of the Android loader in developer mode, not ASUS firmware or a replacement firmware image. Its disk-write callback deliberately does not write.
 
 The audio diagnosis used the Linux Lapis board quirk and SOF topology sources. The [ExpertBook audio notes](https://github.com/burakgon/asus-expertbook-linux/tree/main/audio-fix) helped identify the matching `1043:15e4` speaker tuning. That project's patcher and firmware blobs are not incorporated. ExpertBook firmware must not be flashed onto a Googlebook.

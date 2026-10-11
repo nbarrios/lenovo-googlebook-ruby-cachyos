@@ -101,6 +101,84 @@ Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby modul
 
 The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block). Xe feature switches live only in `/etc/modprobe.d/ruby-xe.conf`, not the kernel command line, so changing them needs a reboot but no boot-set rebuild. All Xe display power features run at driver defaults (10 October 2026: stable at 120 Hz, DC3→DC5→DC6 entered, driver selects Panel Replay with selective update, which disables FBC). To fall back, add `enable_panel_replay=0 enable_psr=0` (then `enable_fbc=0 enable_dsb=0 enable_sagv=0 enable_dc=0`) to the `options xe` line and reboot. Systems installed earlier: remove the `xe.enable_*` entries from `/etc/kernel/cmdline`, then `kernel_update.py prepare --no-upgrade` and `commit`.
 
+## Fingerprint
+
+The reader is a Google fingerprint MCU on internal USB (`18d1:5402`, interface `ff/5a/00`). Linux 7.2 has no driver for that transport. Google's `cros_ec_usb` driver was posted to LKML (v6, September 2025) but is not merged. Research and the security model: [research/fingerprint.md](research/fingerprint.md). **Status:** the module is compile-tested against `7.2.9-2-cachyos` (plain build and `dkms build`) and has not yet been loaded on the laptop.
+
+`assets/installed/cros-ec-usb/` holds:
+
+- the unmodified v6 `cros_ec_usb.c`;
+- the private `cros_ec.h` header from Linux v7.2, which `linux-cachyos-headers` lacks;
+- two patches that DKMS applies when it builds:
+  - `0001` ports the driver to the 6.18+ cros_ec core, which no longer allocates buffers or initialises the lock in `cros_ec_register()`;
+  - `0002` unregisters the EC when the module is unloaded, so `rmmod` is safe.
+
+Install:
+
+```sh
+sudo pacman -S --needed dkms linux-cachyos-headers
+sudo ~/googlebook-ruby/tools/install_fingerprint_driver.sh
+dkms status cros-ec-usb          # cros-ec-usb/6.1, <kernel>, x86_64: installed
+```
+
+The installer does three things:
+
+- copies the package to `/usr/src/cros-ec-usb-6.1`;
+- runs `dkms install` for every installed kernel that has headers;
+- writes `/etc/modprobe.d/ruby-fingerprint.conf` (`blacklist cros_ec_usb`). Without that file udev would load the module at the next boot. It does not stop an explicit `modprobe`.
+
+DKMS signs the module with its own generated key (`/var/lib/dkms/mok.key`). The kernel does not trust that key. CachyOS does not enforce module signatures, so the module loads and the kernel is marked tainted.
+
+**Kernel updates.** pacman runs hooks in file-name order:
+
+1. `05-asus-kernel-snapshot.hook` copies the running kernel's module tree, including `updates/dkms/cros_ec_usb.ko*`.
+2. DKMS's `71-dkms-remove.hook` then removes the module from the old tree. The old kernel's paths count as removed, because the release string changes with every package version.
+3. After the upgrade, `70-dkms-install.hook` builds the module for the new kernel. This happens before `zz-asus-kernel-stage.hook`, which restores the old tree with the module.
+
+The headers must change in the same transaction as the kernel. `pacman -Syu` and `kernel_update.py prepare` both do this. No mkinitcpio hook adds `cros_ec_usb`, so the small boot initramfs never contains it. Only the blacklist line goes into the initramfs, through `modconf`.
+
+### First test
+
+Do this after the driver is installed, from a normal boot:
+
+```sh
+sudo modprobe cros_ec_usb        # also loads cros_ec and cros_ec_proto
+sudo dmesg | tail -n 30          # expect "Chrome EC device registered" on 3-7:1.0
+ls -l /dev/cros_fp               # root-only character device
+```
+
+If `/dev/cros_fp` is missing but dmesg shows the registration, load the children by hand: `sudo modprobe cros_ec_dev cros_ec_chardev`. If dmesg shows `Timed out waiting for response` or `Cannot identify the EC`, save the log and unload the driver.
+
+The Googlebook OS `ectool` is an Android binary and won't run here. EC `main`'s `ectool` no longer builds outside ChromiumOS: at `fc818f5c` it needs `libchrome` and `libec`. The R107 branch builds with only libusb:
+
+```sh
+sudo pacman -S --needed base-devel libusb
+mkdir -p ~/src/ec-r107 && cd ~/src/ec-r107
+curl -L https://chromium.googlesource.com/chromiumos/platform/ec/+archive/24a1cee59942b595f459d69c2aa2f97d37b268df.tar.gz | bsdtar -xf -
+make BOARD=host LIBFTDIUSB_CFLAGS=-I/usr/include/libusb-1.0 LIBFTDIUSB_LDLIBS=-lusb-1.0 build/host/util/ectool
+sudo ./build/host/util/ectool --name=cros_fp version
+sudo ./build/host/util/ectool --name=cros_fp fpinfo
+sudo ./build/host/util/ectool --name=cros_fp fpencstatus
+```
+
+About the AUR alternatives:
+
+- `chromium-ectool` packages the same R107 branch, but it downloads an unpinned tarball (`sha256sums=SKIP`) and needs libftdi.
+- The AUR package named `ectool` is coreboot's tool, which is unrelated.
+
+`version` should print the RO and RW firmware versions, which should be `srebrna` builds. `fpinfo` should report the Egis sensor. `fpencstatus` shows whether a seed is already set. If Googlebook OS ran before a warm reboot, reset the MCU with `ectool --name=cros_fp reboot_ec`. The MCU then re-enumerates, and `/dev/cros_fp` stays.
+
+Unload with `sudo modprobe -r cros_ec_usb`. First close everything that holds `/dev/cros_fp` open, such as fprintd or ectool. Unloading while it is open is a use-after-free in `cros_ec_chardev`, and the same applies to every cros_ec transport.
+
+Once the test passes, enable loading at boot with `sudo ~/googlebook-ruby/tools/install_fingerprint_driver.sh --autoload`. This removes the blacklist file; rerunning without `--autoload` puts it back. To uninstall:
+
+```sh
+sudo dkms remove cros-ec-usb/6.1 --all
+sudo rm -rf /usr/src/cros-ec-usb-6.1 /etc/modprobe.d/ruby-fingerprint.conf
+```
+
+Userspace (libfprint `crfpmoc`, fprintd, a TPM-sealed seed) is the next step in the research plan. It is not installed yet.
+
 ## Kernel updates
 
 Kernel upgrades arrive with ordinary `pacman -Syu`. Only the disk write is manual:

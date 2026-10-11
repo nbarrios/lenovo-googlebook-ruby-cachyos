@@ -1,0 +1,93 @@
+Subject: [PATCH 1/2] cros_ec_usb: set up cros_ec_device fields for Linux >= 6.18
+
+Applies to cros_ec_usb.c from "[PATCH v6] platform/chrome: Add ChromeOS EC
+USB driver" (sha256 c656d58f85646e668e62a484125609fcfc0850eb0e26ea599cafc1277480f8ed).
+
+Mainline 918856986014 ("platform/chrome: Centralize cros_ec_device
+allocation") and 7a79b0bfd8b3 ("platform/chrome: cros_ec: Separate
+initialization from cros_ec_register()"), both first in v6.18, moved the din/dout buffers, the
+lock, the notifier heads and the initial max_request/max_response out of
+cros_ec_register() into cros_ec_device_alloc(). v6 predates that, so on
+7.2 the first transfer (cros_ec_rwsig_continue) would dereference a NULL
+dout and lock an uninitialised mutex.
+
+cros_ec_device_alloc() is not used directly: it allocates with devm on the
+USB interface, but this driver keeps ec_dev across USB re-enumeration.
+Instead the first probe initialises the same fields by hand, and the
+existing din/dout allocation runs on every probe instead of only on a
+reprobe. Lockdep key registration is omitted; mutex_init() then uses its
+static per-call-site class, which is sufficient for one EC per idProduct.
+
+--- a/cros_ec_usb.c
++++ b/cros_ec_usb.c
+@@ -378,33 +378,48 @@
+ 		ec_dev->irq = 0;
+ 		ec_dev->cmd_xfer = NULL;
+ 		ec_dev->pkt_xfer = do_cros_ec_pkt_xfer_usb;
++		/*
++		 * Since Linux 6.18 cros_ec_register() no longer sets up the lock,
++		 * notifier heads, transfer limits and buffers; cros_ec_device_alloc()
++		 * does. That helper allocates with devm on this interface, but this
++		 * driver keeps ec_dev across USB re-enumeration, so mirror it here
++		 * without devm (sizes as in cros_ec_device_alloc()).
++		 */
++		mutex_init(&ec_dev->lock);
++		BLOCKING_INIT_NOTIFIER_HEAD(&ec_dev->event_notifier);
++		BLOCKING_INIT_NOTIFIER_HEAD(&ec_dev->panic_notifier);
++		ec_dev->max_response = sizeof(struct ec_response_get_protocol_info);
++		ec_dev->max_request = sizeof(struct ec_params_rwsig_action);
++		ec_dev->suspend_timeout_ms = EC_HOST_SLEEP_TIMEOUT_DEFAULT;
+ 		ec_dev->din_size = sizeof(struct ec_host_response) +
+-				   sizeof(struct ec_response_get_protocol_info);
++				   sizeof(struct ec_response_get_protocol_info) +
++				   EC_MAX_RESPONSE_OVERHEAD;
+ 		ec_dev->dout_size = sizeof(struct ec_host_request) +
+-				    sizeof(struct ec_params_rwsig_action);
++				    sizeof(struct ec_params_rwsig_action) +
++				    EC_MAX_REQUEST_OVERHEAD;
+ 	} else {
+ 		ec_dev = ec_usb->ec_dev;
++	}
+ 
+-		/*
+-		 * We need to allocate dout and din buffers, because cros_ec_register
+-		 * won't be called. These buffers were freed once previous usb device was
+-		 * disconnected. Use buffer sizes from the last query.
+-		 * The EC_HOST_EVENT_INTERFACE_READY event will be triggered at the end
+-		 * of a boot, which calls cros_ec_query_all function, that reallocates
+-		 * buffers.
+-		 */
+-		ec_dev->din = devm_kzalloc(if_dev, ec_dev->din_size, GFP_KERNEL);
+-		if (!ec_dev->din) {
+-			ret = -ENOMEM;
+-			dev_err(if_dev, "Failed to allocate din buffer\n");
+-			goto error;
+-		}
+-		ec_dev->dout = devm_kzalloc(if_dev, ec_dev->dout_size, GFP_KERNEL);
+-		if (!ec_dev->dout) {
+-			ret = -ENOMEM;
+-			dev_err(if_dev, "Failed to allocate dout buffer\n");
+-			goto error;
+-		}
++	/*
++	 * Allocate dout and din buffers on every probe: cros_ec_register() no
++	 * longer does it on the first one, and on a reprobe the previous buffers
++	 * were freed when the previous usb device was disconnected. A reprobe
++	 * uses buffer sizes from the last query. The EC_HOST_EVENT_INTERFACE_READY
++	 * event will be triggered at the end of a boot, which calls
++	 * cros_ec_query_all function, that reallocates buffers.
++	 */
++	ec_dev->din = devm_kzalloc(if_dev, ec_dev->din_size, GFP_KERNEL);
++	if (!ec_dev->din) {
++		ret = -ENOMEM;
++		dev_err(if_dev, "Failed to allocate din buffer\n");
++		goto error;
++	}
++	ec_dev->dout = devm_kzalloc(if_dev, ec_dev->dout_size, GFP_KERNEL);
++	if (!ec_dev->dout) {
++		ret = -ENOMEM;
++		dev_err(if_dev, "Failed to allocate dout buffer\n");
++		goto error;
+ 	}
+ 
+ 	ec_dev->dev = if_dev;

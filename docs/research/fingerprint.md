@@ -91,6 +91,7 @@ The two main pieces already exist. Each needs a little adaptation:
   - Bundles FPMCU firmware for `srebrna`, `sanok`, `chobienia`, `chojnik`, `buccaneer`, `helipilot` and runs an updater.
   - Ruby's `fingerprint_*.xml` says `board=srebrna`, `STAND_ALONE`, `KEYBOARD_TOP_RIGHT`. **[V from extracted apex]**
   - The vendor `ectool` is an Android binary. On Linux, build upstream `util/ectool` from the EC repo or use crosec-rs. **[I]**
+    - Correction (10 Oct 2026, build-tested): EC `main` (`fc818f5c`) `ectool` no longer builds standalone; it needs ChromiumOS `libchrome` and platform2 `libec`. Branch `release-R107-15117.B-main` (`24a1cee5`) builds with only libusb and has `--name=cros_fp`, `fpinfo` and `fpencstatus`. See the Fingerprint section of `docs/cachyos-ruby.md`. **[V]**
 
 ## Q4 — Security model
 

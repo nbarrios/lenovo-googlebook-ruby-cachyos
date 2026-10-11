@@ -1,0 +1,81 @@
+Subject: [PATCH 2/2] cros_ec_usb: unregister ECs on module unload
+
+USB disconnect deliberately keeps the cros_ec_device registered so that
+/dev/cros_X survives EC reboots and re-enumeration. With module_usb_driver()
+nothing ever unregisters it, so after rmmod the cros-ec-dev platform
+devices keep calling a pkt_xfer pointer into freed module text, and
+ec_dev, ec_usb and the registered_list nodes leak.
+
+Replace module_usb_driver() with explicit init/exit. Exit first calls
+usb_deregister(), which disconnects every bound interface (kills the
+interrupt URB, cancels the event work, marks the EC disconnected so any
+further command returns -ENODEV) and guarantees no new probe. It then
+walks registered_list, calls cros_ec_unregister() and frees each entry.
+
+Also clear the pointers released by cros_ec_usb_delete(). ec_usb outlives
+the USB device, so a reprobe that fails before taking new references
+(din/dout allocation, which patch 1 makes run on every probe) would
+otherwise put the old interface and device and free the old URB twice.
+
+Limitation (same as for every cros_ec transport unbind): close users of
+/dev/cros_X, e.g. stop fprintd, before rmmod.
+
+--- a/cros_ec_usb.c
++++ b/cros_ec_usb.c
+@@ -334,6 +334,16 @@
+ 	usb_put_dev(ec_usb->udev);
+ 	kfree(ec_usb->int_in_buffer);
+ 	kfree(ec_usb->bulk_in_buffer);
++
++	/*
++	 * ec_usb outlives the usb device. A reprobe that fails before taking
++	 * new references must not put or free these a second time.
++	 */
++	ec_usb->int_in_urb = NULL;
++	ec_usb->interface = NULL;
++	ec_usb->udev = NULL;
++	ec_usb->int_in_buffer = NULL;
++	ec_usb->bulk_in_buffer = NULL;
+ }
+ 
+ static int cros_ec_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
+@@ -595,7 +605,38 @@
+ 	/* Do not autosuspend EC */
+ 	.supports_autosuspend = 0,
+ };
+-module_usb_driver(cros_ec_usb);
++
++static int __init cros_ec_usb_init(void)
++{
++	return usb_register(&cros_ec_usb);
++}
++module_init(cros_ec_usb_init);
++
++/*
++ * Disconnect deliberately keeps each EC registered (so /dev/cros_X survives
++ * EC reboots), which leaves the cros-ec-dev children pointing at this
++ * module's pkt_xfer. Unregister them before the module text goes away.
++ */
++static void __exit cros_ec_usb_exit(void)
++{
++	struct registered_ec *ec, *tmp;
++
++	/* Unbind all interfaces: no probe, URB callback or event work runs after this. */
++	usb_deregister(&cros_ec_usb);
++
++	mutex_lock(&registered_list_mutex);
++	list_for_each_entry_safe(ec, tmp, &registered_list, node) {
++		/* Commands sent during teardown fail with -ENODEV (disconnected). */
++		cros_ec_unregister(ec->ec_usb->ec_dev);
++		mutex_destroy(&ec->ec_usb->ec_dev->lock);
++		kfree(ec->ec_usb->ec_dev);
++		kfree(ec->ec_usb);
++		list_del(&ec->node);
++		kfree(ec);
++	}
++	mutex_unlock(&registered_list_mutex);
++}
++module_exit(cros_ec_usb_exit);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("ChromeOS EC USB HC driver");
