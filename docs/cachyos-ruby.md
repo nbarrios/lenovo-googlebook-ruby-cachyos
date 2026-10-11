@@ -115,4 +115,4 @@ sudo ~/googlebook-ruby/tools/kernel_update.py confirm
 
 If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition as `omarchy_root`, mount subvolume `@` on `/mnt`, then run `kernel_update.py rollback --root /mnt` from the kit. From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`.
 
-The build and loader-validation pipeline was exercised on the device with 7.2.9-1-cachyos and the device GPT; a physical kernel upgrade has not yet been performed.
+First physical upgrade, 7.2.9-1 to 7.2.9-2-cachyos, completed on 10 October 2026: prepare, commit, reboot and confirm, with audio, Xe and speaker calibration working afterwards.
