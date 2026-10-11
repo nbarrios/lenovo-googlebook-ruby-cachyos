@@ -26,7 +26,9 @@ PACKAGES = [
     'networkmanager', 'pipewire', 'pipewire-pulse', 'pipewire-alsa', 'wireplumber',
     'mesa', 'vulkan-intel', 'intel-media-driver', 'snapper',
 ]
-XE_OPTIONS = 'gsc_firmware_path= enable_panel_replay=0 enable_psr=0 enable_fbc=0 enable_dsb=0 enable_sagv=0 enable_dc=0'
+# DC states, FBC, DSB and SAGV verified on Ruby at 120 Hz (10 October 2026); panel
+# self-refresh stays off until tested.
+XE_OPTIONS = 'gsc_firmware_path= enable_panel_replay=0 enable_psr=0'
 
 
 def pacman_conf(live):

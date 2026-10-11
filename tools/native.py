@@ -208,10 +208,13 @@ def build(args):
     kernel = TARGET / configured.get('kernel', '/boot/vmlinuz-linux-t2').lstrip('/')
     initramfs = TARGET / configured.get('initramfs', '/boot/initramfs-linux-t2.img').lstrip('/')
     kernel_sha256 = configured.get('kernel_sha256', KERNEL_SHA256)
+    # CachyOS sets the Xe feature switches in /etc/modprobe.d/ruby-xe.conf so they
+    # can change without rebuilding the boot set; the command line would override it.
+    xe = XE_PARAMETERS if 'kernel' not in configured else {'gsc_firmware_path': ''}
     cmdline = (f"cryptdevice=UUID={p['luks_uuid']}:omarchy_root root=/dev/mapper/omarchy_root rootfstype=btrfs rootflags=subvol=@ rw "
                'zswap.enabled=0 modprobe.blacklist=xe initramfs_async=0 console=tty0 loglevel=3 log_buf_len=4M '
                'printk.time=1 panic=30 fbcon=nodefer plymouth.enable=0 rd.plymouth=0 ' +
-               ' '.join('xe.' + k + '=' + v for k, v in XE_PARAMETERS.items()))
+               ' '.join('xe.' + k + '=' + v for k, v in xe.items()))
     require(initramfs.stat().st_size < 29 * 1024**2, 'Initramfs too large')
     build_set(kernel, initramfs, cmdline, STATE / 'candidate', ROOT / 'vendor',
               sizes={p['name']: p['size'] for p in gpt.partitions()}, installed=True, kernel_sha256=kernel_sha256)

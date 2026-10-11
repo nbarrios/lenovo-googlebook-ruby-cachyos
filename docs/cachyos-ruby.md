@@ -97,6 +97,10 @@ Factory per-speaker calibration lives in coreboot VPD (`dsm_calib_register_array
 
 Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby module (`intel/sof-ipc4/ptl/ruby/sof-ptl.ri`, 2.14.1008.1) and a topology with `dolby-dax` pipelines. `ruby-dax.conf` points `snd_sof_pci` at them, as Googlebook OS's `mod_options --sof-fw` does, and a conditional UCM BootSequence block loads `dax_param.bin` and the factory switch/profile values. Remove `/etc/modprobe.d/ruby-dax.conf` to return to the stock sof-firmware files; the UCM block then skips itself. Toggle live with `amixer -c sofrt5682 cset name='DAX Speaker Switch' on|off`.
 
+## Display
+
+The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block). Xe feature switches live only in `/etc/modprobe.d/ruby-xe.conf`, not the kernel command line, so changing them needs a reboot but no boot-set rebuild. DC states, FBC, DSB and SAGV are at driver defaults (verified 10 October 2026); `enable_psr=0 enable_panel_replay=0` remain until panel self-refresh is tested. Systems installed earlier: remove the `xe.enable_*` entries from `/etc/kernel/cmdline`, then `kernel_update.py prepare --no-upgrade` and `commit`.
+
 ## Kernel updates
 
 Kernel upgrades arrive with ordinary `pacman -Syu`. Only the disk write is manual:
