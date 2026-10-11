@@ -34,6 +34,10 @@ pacman -U --needed "$pkg"
 echo '==> Installing fprintd'
 pacman -S --needed fprintd
 pacman -Q libfprint-crfpmoc fprintd
+# pacman never replaces this package; say when the repo libfprint moves ahead.
+here=$(dirname "$(readlink -f "$0")")
+install -Dm755 "$here/../assets/installed/pacman/libfprint-crfpmoc-check.sh" /usr/local/libexec/libfprint-crfpmoc-check
+install -Dm644 "$here/../assets/installed/pacman/zz-libfprint-crfpmoc-check.hook" /etc/pacman.d/hooks/zz-libfprint-crfpmoc-check.hook
 
 echo '==> Loading cros_ec_usb'
 modprobe cros_ec_usb
