@@ -103,7 +103,7 @@ The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block)
 
 ## Fingerprint
 
-The reader is a Google fingerprint MCU on internal USB (`18d1:5402`, interface `ff/5a/00`). Linux 7.2 has no driver for that transport. Google's `cros_ec_usb` driver was posted to LKML (v6, September 2025) but is not merged. Research and the security model: [research/fingerprint.md](research/fingerprint.md). **Status (10 October 2026, `7.2.9-2-cachyos`):** the DKMS module binds the FPMCU, `/dev/cros_fp` appears and unloading is clean. The FPMCU runs `srebrna` RW `v2.0.31814-42f9aa9` (RO `v2.0.31294-70ef16a`) and answers `FP_INFO` only in version 3. The userspace package below is built and passes the unit and replay tests, but enroll/verify has not yet been run on the laptop.
+The reader is a Google fingerprint MCU on internal USB (`18d1:5402`, interface `ff/5a/00`). Linux 7.2 has no driver for that transport. Google's `cros_ec_usb` driver was posted to LKML (v6, September 2025) but is not merged. Research and the security model: [research/fingerprint.md](research/fingerprint.md). **Status (10 October 2026, `7.2.9-2-cachyos`):** the DKMS module binds the FPMCU, `/dev/cros_fp` appears and unloading is clean. The FPMCU runs `srebrna` RW `v2.0.31814-42f9aa9` (RO `v2.0.31294-70ef16a`) and answers `FP_INFO` only in version 3. The userspace package below is built and passes the unit and replay tests. The first `fprintd-enroll` on the laptop (package `1.94.100-1`) failed with `enroll-unknown-error` (`ioctl failed: No space left on device`), which `0004` fixes in `1.94.100-2`; enroll/verify with `-2` has not yet been run.
 
 `assets/installed/cros-ec-usb/` holds:
 
@@ -179,7 +179,7 @@ sudo rm -rf /usr/src/cros-ec-usb-6.1 /etc/modprobe.d/ruby-fingerprint.conf
 
 ### Userspace: libfprint-crfpmoc and fprintd
 
-`assets/packages/libfprint-crfpmoc/` builds a pacman package `libfprint-crfpmoc`. It is the CachyOS/Arch `libfprint` 1.94.100 PKGBUILD with three patches:
+`assets/packages/libfprint-crfpmoc/` builds a pacman package `libfprint-crfpmoc`. It is the CachyOS/Arch `libfprint` 1.94.100 PKGBUILD with four patches:
 
 - `0001`: libfprint [MR !512](https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/512) (driver `crfpmoc`), pinned to head `56442591`. This is the unmodified MR diff; it applies to 1.94.100 with offsets only.
 - `0002`: `FP_INFO` v2/v3. The MR asks for v1, which srebrna rejects with `INVALID_VERSION`. At open the driver queries `GET_CMD_VERSIONS` and uses the highest of v3/v2/v1, falling back to v1 if the query fails, so older Chromebooks keep working. A v3 response is the header plus 10 frame entries (236 bytes); the EC refuses a smaller buffer. The driver reads only the template fields. Frame sizes are logged, never used.
@@ -188,6 +188,7 @@ sudo rm -rf /usr/src/cros-ec-usb-6.1 /etc/modprobe.d/ruby-fingerprint.conf
   - refuses the file unless it is root-owned with mode 0600 or stricter, in a root-owned directory that is not group or world writable;
   - derives the `FP_CONTEXT` user id as SHA-256(`crfpmoc-userid-v1` ‖ seed), one id for the whole machine;
   - sets the seed only when `fpencstatus` reports it unset, and treats `ACCESS_DENIED` as "already set".
+- `0004`: reply sizes. `FP_MODE` always returns its 4-byte mode, but the MR sent the sensor reset (end of enroll/verify) and the clear-storage `FP_MODE` commands with `insize` 0. The EC transports reject a reply larger than `insize`: over USB the ioctl fails with `ENOSPC` and the kernel logs `Incorrect number of expected bytes: 12`. Every `FP_MODE` now passes `insize` 4. All other commands already used the `ec_commands.h` response sizes; `FP_SEED`, `FP_CONTEXT` v1 and `FP_TEMPLATE` return no data. The replay traces already recorded `insize` 4 (umockdev does not compare `insize`), so they are unchanged.
 
 The package provides and conflicts with `libfprint` (soname `libfprint-2.so=2-64`), so fprintd links against it unchanged and `pacman -Syu` does not swap it back. The source is pinned to the v1.94.100 tag commit and every source has a sha256; the source's blake2 sum matches Arch's signature-checked one. Tests: the full libfprint suite passes (133 tests). It runs serially, because upstream's `egis_etu905` replay times out when tests run in parallel, also without these patches. The suite includes the MR's `crfpmoc` replay, a `crfpmoc-v3` replay (v3 responses, `FP_SEED` denied) and unit tests for the v3 parser and the seed file.
 

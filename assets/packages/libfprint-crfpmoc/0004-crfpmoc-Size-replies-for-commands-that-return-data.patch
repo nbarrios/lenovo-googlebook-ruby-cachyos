@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Barrios <25010449+nbarrios@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 23:30:00 -0700
+Subject: [PATCH 4/4] crfpmoc: Size replies for commands that return data
+
+EC_CMD_FP_MODE always returns struct ec_response_fp_mode (4 bytes), also
+when only setting a mode, but the sensor reset (enroll, verify) and the
+two clear-storage FP_MODE commands were sent with insize 0. The cros_ec
+transports reject a reply longer than insize: the USB FPMCU transport
+fails the ioctl with "No space left on device" ("Incorrect number of
+expected bytes: 12" in the kernel log), and LPC/SPI return -EMSGSIZE.
+On the Lenovo Googlebook 15 FPMCU this made every enroll fail.
+
+Pass sizeof (struct crfpmoc_ec_response_fp_mode) as insize for all
+FP_MODE commands. The other commands already size their replies from
+the ec_commands.h response structs; FP_SEED, FP_CONTEXT v1 and
+FP_TEMPLATE have no response data and keep insize 0.
+
+The replay traces already record insize 4 for these commands, so they
+are unchanged.
+---
+ libfprint/drivers/crfpmoc/crfpmoc.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.c b/libfprint/drivers/crfpmoc/crfpmoc.c
+index 6c637085..9c31b127 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc.c
+@@ -726,7 +726,8 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
+       data->clear_step = 1;
+       p.mode = CRFPMOC_FP_MODE_RESET_SENSOR;
+       new_transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
+-                                                  &p, sizeof (p), 0);
++                                                  &p, sizeof (p),
++                                                  sizeof (struct crfpmoc_ec_response_fp_mode));
+       crfpmoc_ec_transfer_submit_cmd (new_transfer, fpi_device_get_cancellable (device),
+                                       crfpmoc_clear_storage_cb, ssm);
+     }
+@@ -1483,7 +1484,8 @@ handle_enroll_reset (FpiSsm *ssm)
+   CrfpMocEcTransfer *transfer;
+ 
+   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
+-                                          &p, sizeof (p), 0);
++                                          &p, sizeof (p),
++                                          sizeof (struct crfpmoc_ec_response_fp_mode));
+   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
+ }
+ 
+@@ -1754,7 +1756,8 @@ handle_verify_reset (FpiSsm *ssm)
+   CrfpMocEcTransfer *transfer;
+ 
+   transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
+-                                          &p, sizeof (p), 0);
++                                          &p, sizeof (p),
++                                          sizeof (struct crfpmoc_ec_response_fp_mode));
+   crfpmoc_ec_transfer_submit_cmd (transfer, NULL, crfpmoc_ssm_ec_transfer_cb, ssm);
+ }
+ 
+@@ -1983,7 +1986,8 @@ crfpmoc_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
+       data->clear_step = 0;
+ 
+       transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_MODE, 0,
+-                                              &p, sizeof (p), 0);
++                                              &p, sizeof (p),
++                                              sizeof (struct crfpmoc_ec_response_fp_mode));
+       crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                       crfpmoc_clear_storage_cb, ssm);
+       break;
