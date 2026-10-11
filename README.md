@@ -20,7 +20,8 @@ An experimental route to native **CachyOS on the Lenovo Googlebook 15 (Google Ru
 | Kernel updates | `pacman -Syu` stages and validates the new signed boot images; one command writes them |
 | Suspend | s2idle reaches S0ix; about 0.35 %/hour overnight; power key and lid suspend |
 | Camera and Bluetooth | UVC camera; Bluetooth audio with AAC and headset microphone |
-| Not tested | External displays beyond a basic dock, USB-C hotplug after resume |
+| External display | USB-C DisplayPort, including hotplug after resume |
+| Not tested | Thunderbolt docks, HDMI adapters, multiple external displays, deep sleep (S3) |
 
 ## Start here
 
