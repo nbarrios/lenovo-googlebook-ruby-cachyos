@@ -12,6 +12,8 @@
 #        user id derived from it, so prints survive reboots.
 #  0004  Size the reply buffer (insize 4) for every FP_MODE command; the
 #        reset and clear-storage ones used 0, which the EC transports reject.
+#  0005  Give the MKBP poll callback the GPollableSourceFunc signature; it
+#        received the stream as its state machine and crashed fprintd.
 #
 # Rebuild when CachyOS updates libfprint: bump pkgver and the commit, check
 # that the patches still apply, run updpkgsums.
@@ -19,7 +21,7 @@
 pkgname=libfprint-crfpmoc
 _pkgname=libfprint
 pkgver=1.94.100
-pkgrel=2
+pkgrel=3
 # Signed tag v1.94.100. The source checksum equals Arch's b2sum for the
 # signature-verified tag (56cbe62a...0e15466d08), so no PGP key is needed here.
 _commit=80a4b5ec612892c5c056c48dddaa561452cf37ec
@@ -58,12 +60,14 @@ source=(
   0002-crfpmoc-Support-EC_CMD_FP_INFO-v2-v3.patch
   0003-crfpmoc-Use-a-persistent-seed-and-a-stable-user-id.patch
   0004-crfpmoc-Size-replies-for-commands-that-return-data.patch
+  0005-crfpmoc-Give-the-MKBP-poll-callback-the-GPollableSourceFunc-signature.patch
 )
 sha256sums=('18fcee9ffb2adb9ba2ea229850e9266d0bcad2df5fad556beffce6c8ba84f192'
             '6afd5e32fc7a7f70a1730286890d21ed05e76ce1c866a5ea19804d8321f1113b'
             'c07686cca5756f561700c33696c35fff7d6b1d41ebba1eac5d3453f05f955988'
             '4be3458b6a4d7c49b80521d7f938a39598f36a4f8ba53537d7208af7f025475e'
-            '39ff13a80cfe454368e1a331cee525876604ab636d3a8fe9cb2c74b920326fdc')
+            '39ff13a80cfe454368e1a331cee525876604ab636d3a8fe9cb2c74b920326fdc'
+            'f0dfe380ed5a600a1c028da2fb2476269538eb89cbb7066550b3e8db8498634c')
 
 prepare() {
   cd $_pkgname

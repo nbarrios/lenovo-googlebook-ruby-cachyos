@@ -1,0 +1,42 @@
+From 4f27ff0929b4d7016d5221b924494a641c078d10 Mon Sep 17 00:00:00 2001
+From: Nick Barrios <25010449+nbarrios@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:50:00 -0700
+Subject: [PATCH 5/5] crfpmoc: Give the MKBP poll callback the
+ GPollableSourceFunc signature
+
+g_pollable_input_stream_create_source() dispatches its callback as
+GPollableSourceFunc (pollable_stream, user_data). crfpmoc_read_bytes()
+took only user_data, so it received the stream as its state machine and
+crashed fprintd on the first MKBP event (FP_IS_DEVICE and
+G_IS_POLLABLE_INPUT_STREAM assertions, then SIGSEGV), seen on a Google
+FPMCU (srebrna) over USB. Also drop the creation reference on the source
+once attached.
+---
+ libfprint/drivers/crfpmoc/crfpmoc.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.c b/libfprint/drivers/crfpmoc/crfpmoc.c
+index 9c31b127..019fc794 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc.c
+@@ -406,7 +406,7 @@ crfpmoc_umockdev_record (FpiDeviceCrfpMoc *self, int res,
+  * to see if a timeout is active.
+  */
+ static gboolean
+-crfpmoc_read_bytes (gpointer user_data)
++crfpmoc_read_bytes (GObject *pollable_stream, gpointer user_data)
+ {
+   g_autoptr(GError) error = NULL;
+   FpiSsm *ssm = user_data;
+@@ -596,8 +596,10 @@ crfpmoc_eventmask_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
+   GSource *poll_source = g_pollable_input_stream_create_source (
+     G_POLLABLE_INPUT_STREAM (data->poll_input_stream),
+     fpi_device_get_cancellable (device));
+-  g_source_set_callback (poll_source, crfpmoc_read_bytes, ssm, NULL);
++  /* A pollable source dispatches GPollableSourceFunc (stream, user_data). */
++  g_source_set_callback (poll_source, G_SOURCE_FUNC (crfpmoc_read_bytes), ssm, NULL);
+   data->poll_source = g_source_attach (poll_source, NULL);
++  g_source_unref (poll_source);
+ }
+ 
+ /* Enable device event reporting and queue a callback when there is
