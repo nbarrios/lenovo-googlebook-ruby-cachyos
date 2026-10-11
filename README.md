@@ -4,6 +4,10 @@ An experimental route to native **Omarchy 4.0.4 on ASUS Googlebook 14 (CX9406CAA
 
 The original procedure booted a full Omarchy desktop from the internal 512 GB NVMe with the USB removed. Display, keyboard/touchpad, Wi-Fi, hardware rendering and audible speaker playback were verified on one laptop on **7 October 2026**, including a subsequent internal boot. This repository turns that work into a reproducible image builder, staged installation tools and recovery documentation.
 
+> **This fork adds the Lenovo Googlebook 15 (Google Ruby) with CachyOS.** It reuses the Lapis boot path and adds a CachyOS installer, Ruby audio (SOF, TAS2563 amplifiers with factory calibration, Dolby DAX), 120 Hz display power management, a kernel-update workflow driven by pacman hooks, and fingerprint support (USB FPMCU driver plus a patched libfprint). Start with [CachyOS on Ruby](docs/cachyos-ruby.md); the rest of this README describes the upstream Lapis/Omarchy project by [jmklex](https://github.com/jmklex/asus-googlebook-omarchy).
+>
+> **Built with AI assistance.** The Ruby port (code, patches and documentation) was developed with substantial help from an AI assistant, Anthropic's Claude, working under the direction of the maintainer and tested on one physical laptop. Review the scripts before running them as root.
+
 **Early experimental release.** The generalized installation scripts have not yet completed a fresh installation on a second laptop. Do not treat software tests or a successful image build as another physical installation. Start with the live USB and stop if your hardware differs. This is a community project, unaffiliated with ASUS, Google or Omarchy.
 
 ## Start here
