@@ -1,0 +1,1810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Barrios <25010449+nbarrios@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:02:03 -0700
+Subject: [PATCH 2/3] crfpmoc: Support EC_CMD_FP_INFO v2/v3
+
+Newer Zephyr FPMCU firmware (e.g. the USB srebrna FPMCU in the Lenovo
+Googlebook 15) only implements FP_INFO v3 and answers v1 with
+EC_RES_INVALID_VERSION. Query the supported versions with
+EC_CMD_GET_CMD_VERSIONS v1 at open, use the highest of v3/v2/v1, size the
+response for the header plus FP_MAX_CAPTURE_TYPES frame entries (the EC
+refuses smaller buffers) and parse it into a version independent struct.
+Frame parameters are informational only (the driver does not capture
+images). Falls back to v1 if GET_CMD_VERSIONS fails.
+---
+ .../drivers/crfpmoc/crfpmoc-ec-transfer.c     |   7 +-
+ .../drivers/crfpmoc/crfpmoc-ec-transfer.h     |   2 +
+ libfprint/drivers/crfpmoc/crfpmoc-fp-info.c   | 205 ++++++++++
+ libfprint/drivers/crfpmoc/crfpmoc-fp-info.h   | 109 ++++++
+ libfprint/drivers/crfpmoc/crfpmoc.c           | 167 ++++++--
+ libfprint/drivers/crfpmoc/crfpmoc.h           |   6 +-
+ libfprint/meson.build                         |   1 +
+ tests/crfpmoc-v3/custom.ioctl                 | 362 ++++++++++++++++++
+ tests/crfpmoc-v3/custom.py                    | 160 ++++++++
+ tests/crfpmoc-v3/device                       | 205 ++++++++++
+ tests/crfpmoc/custom.ioctl                    |   1 +
+ tests/meson.build                             |  22 ++
+ tests/test-crfpmoc-fp-info.c                  | 268 +++++++++++++
+ 13 files changed, 1484 insertions(+), 31 deletions(-)
+ create mode 100644 libfprint/drivers/crfpmoc/crfpmoc-fp-info.c
+ create mode 100644 libfprint/drivers/crfpmoc/crfpmoc-fp-info.h
+ create mode 100644 tests/crfpmoc-v3/custom.ioctl
+ create mode 100755 tests/crfpmoc-v3/custom.py
+ create mode 100644 tests/crfpmoc-v3/device
+ create mode 100644 tests/test-crfpmoc-fp-info.c
+
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.c b/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.c
+index 4b9584f1..05bd4ed4 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.c
+@@ -102,6 +102,8 @@ do_ioctl_xcmd (CrfpMocEcTransfer                 *transfer,
+       return -1;
+     }
+ 
++  transfer->ec_result = s_cmd->result;
++
+   if (s_cmd->result != EC_RES_SUCCESS)
+     {
+       g_set_error (error,
+@@ -112,8 +114,10 @@ do_ioctl_xcmd (CrfpMocEcTransfer                 *transfer,
+       return -1;
+     }
+ 
++  transfer->inlen = MIN (r, transfer->insize);
++
+   if (transfer->insize > 0 && transfer->indata)
+-    memcpy (transfer->indata, s_cmd->data, MIN (r, transfer->insize));
++    memcpy (transfer->indata, s_cmd->data, transfer->inlen);
+ 
+   return r;
+ }
+@@ -211,6 +215,7 @@ crfpmoc_ec_transfer_new_cmd (FpDevice     *device,
+   transfer->version = version;
+   transfer->outsize = outsize;
+   transfer->insize = insize;
++  transfer->ec_result = -1;
+ 
+   if (outsize > 0)
+     transfer->outdata = g_memdup2 (outdata, outsize);
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.h b/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.h
+index dc70b56c..a293710f 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.h
++++ b/libfprint/drivers/crfpmoc/crfpmoc-ec-transfer.h
+@@ -37,6 +37,8 @@ typedef struct _CrfpMocEcTransfer
+   int   outsize;
+   void *indata;                /* owned, allocated to insize */
+   int   insize;
++  int   inlen;                 /* bytes actually received (ioctl return value) */
++  int   ec_result;             /* EC result code (enum crfpmoc_ec_status) */
+ 
+   /* For CRFPMOC_CROS_EC_DEV_IOCEVENTMASK_V2 */
+   unsigned long event_mask;
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-fp-info.c b/libfprint/drivers/crfpmoc/crfpmoc-fp-info.c
+new file mode 100644
+index 00000000..a44b5e20
+--- /dev/null
++++ b/libfprint/drivers/crfpmoc/crfpmoc-fp-info.c
+@@ -0,0 +1,205 @@
++/*
++ * ChromeOS Fingerprint driver for libfprint - EC_CMD_FP_INFO parsing
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++#include <gio/gio.h>
++
++#include "crfpmoc-fp-info.h"
++
++/* The EC protocol is little endian; read fields explicitly instead of
++ * casting the buffer, so short or unaligned responses are safe. */
++static guint16
++rd16 (const guint8 *p)
++{
++  return (guint16) (p[0] | (p[1] << 8));
++}
++
++static guint32
++rd32 (const guint8 *p)
++{
++  return (guint32) p[0] | ((guint32) p[1] << 8) |
++         ((guint32) p[2] << 16) | ((guint32) p[3] << 24);
++}
++
++int
++crfpmoc_fp_info_pick_version (guint32 version_mask)
++{
++  for (int v = 3; v >= 1; v--)
++    if (version_mask & (1u << v))
++      return v;
++  return -1;
++}
++
++static gsize
++frame_entry_size (int version)
++{
++  return version == 3 ? CRFPMOC_FP_INFO_V3_FRAME_SIZE : CRFPMOC_FP_INFO_V2_FRAME_SIZE;
++}
++
++gsize
++crfpmoc_fp_info_response_size (int version)
++{
++  switch (version)
++    {
++    case 1:
++      return CRFPMOC_FP_INFO_V1_SIZE;
++
++    case 2:
++    case 3:
++      return CRFPMOC_FP_INFO_V2_HEADER_SIZE +
++             CRFPMOC_FP_MAX_CAPTURE_TYPES * frame_entry_size (version);
++
++    default:
++      return 0;
++    }
++}
++
++static void
++parse_v1 (const guint8 *b, CrfpMocFpInfo *info)
++{
++  /* struct ec_response_fp_info */
++  info->vendor_id = rd32 (b + 0);
++  info->product_id = rd32 (b + 4);
++  info->model_id = rd32 (b + 8);
++  info->version = rd32 (b + 12);
++  info->frame_size = rd32 (b + 16);
++  info->pixel_format = rd32 (b + 20);
++  info->width = rd16 (b + 24);
++  info->height = rd16 (b + 26);
++  info->bpp = rd16 (b + 28);
++  info->errors = rd16 (b + 30);
++  info->template_size = rd32 (b + 32);
++  info->template_max = rd16 (b + 36);
++  info->template_valid = rd16 (b + 38);
++  info->template_dirty = rd32 (b + 40);
++  info->template_version = rd32 (b + 44);
++  info->num_capture_types = 1;
++  info->has_frame = TRUE;
++  info->capture_type = CRFPMOC_FP_CAPTURE_VENDOR_FORMAT;
++}
++
++static void
++parse_v2_v3 (int version, const guint8 *b, gsize len, CrfpMocFpInfo *info)
++{
++  const gsize entry = frame_entry_size (version);
++  gsize available;
++  guint n;
++
++  /* struct fp_sensor_info */
++  info->vendor_id = rd32 (b + 0);
++  info->product_id = rd32 (b + 4);
++  info->model_id = rd32 (b + 8);
++  info->version = rd32 (b + 12);
++  info->num_capture_types = rd16 (b + 16);
++  info->errors = rd16 (b + 18);
++  /* struct fp_template_info */
++  info->template_size = rd32 (b + 20);
++  info->template_max = rd16 (b + 24);
++  info->template_valid = rd16 (b + 26);
++  info->template_dirty = rd32 (b + 28);
++  info->template_version = rd32 (b + 32);
++
++  /* Frame parameters: never trust num_capture_types beyond what was
++   * actually received or the protocol maximum. Prefer the vendor-format
++   * entry, else take the first one. */
++  available = (len - CRFPMOC_FP_INFO_V2_HEADER_SIZE) / entry;
++  n = MIN (MIN ((gsize) info->num_capture_types, available),
++           (gsize) CRFPMOC_FP_MAX_CAPTURE_TYPES);
++
++  for (guint i = 0; i < n; i++)
++    {
++      const guint8 *f = b + CRFPMOC_FP_INFO_V2_HEADER_SIZE + i * entry;
++      guint8 type;
++
++      if (version == 3)
++        type = f[18]; /* after frame_size, image_data_offset_bytes, pixel_format, w, h, bpp */
++      else
++        type = f[14]; /* after frame_size, pixel_format, w, h, bpp */
++
++      if (info->has_frame && type != CRFPMOC_FP_CAPTURE_VENDOR_FORMAT)
++        continue;
++
++      info->has_frame = TRUE;
++      info->capture_type = type;
++      info->frame_size = rd32 (f);
++      if (version == 3)
++        {
++          info->pixel_format = rd32 (f + 8);
++          info->width = rd16 (f + 12);
++          info->height = rd16 (f + 14);
++          info->bpp = rd16 (f + 16);
++        }
++      else
++        {
++          info->pixel_format = rd32 (f + 4);
++          info->width = rd16 (f + 8);
++          info->height = rd16 (f + 10);
++          info->bpp = rd16 (f + 12);
++        }
++
++      if (type == CRFPMOC_FP_CAPTURE_VENDOR_FORMAT)
++        break;
++    }
++}
++
++gboolean
++crfpmoc_fp_info_parse (int            version,
++                       const guint8  *buf,
++                       gsize          len,
++                       CrfpMocFpInfo *info,
++                       GError       **error)
++{
++  gsize need;
++
++  g_return_val_if_fail (info != NULL, FALSE);
++
++  memset (info, 0, sizeof (*info));
++
++  switch (version)
++    {
++    case 1:
++      need = CRFPMOC_FP_INFO_V1_SIZE;
++      break;
++
++    case 2:
++    case 3:
++      need = CRFPMOC_FP_INFO_V2_HEADER_SIZE;
++      break;
++
++    default:
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                   "Unsupported FP_INFO version %d", version);
++      return FALSE;
++    }
++
++  if (buf == NULL || len < need)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                   "FP_INFO v%d response too short (%" G_GSIZE_FORMAT
++                   " bytes, need %" G_GSIZE_FORMAT ")",
++                   version, buf ? len : 0, need);
++      return FALSE;
++    }
++
++  if (version == 1)
++    parse_v1 (buf, info);
++  else
++    parse_v2_v3 (version, buf, len, info);
++
++  return TRUE;
++}
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-fp-info.h b/libfprint/drivers/crfpmoc/crfpmoc-fp-info.h
+new file mode 100644
+index 00000000..14aa7521
+--- /dev/null
++++ b/libfprint/drivers/crfpmoc/crfpmoc-fp-info.h
+@@ -0,0 +1,109 @@
++/*
++ * ChromeOS Fingerprint driver for libfprint - EC_CMD_FP_INFO parsing
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/* Device independent (unit tested) parsing of EC_CMD_FP_INFO responses.
++ *
++ * Older FPMCU firmware (bloonchipper, dartmonkey, ...) answers v0/v1 with
++ * struct ec_response_fp_info (48 bytes). Newer Zephyr firmware (e.g. the
++ * USB "srebrna" FPMCU in the Lenovo Googlebook 15) only answers v3:
++ *
++ *   struct ec_response_fp_info_v3 {
++ *     struct fp_sensor_info sensor_info;       20 bytes
++ *     struct fp_template_info template_info;   16 bytes
++ *     struct fp_image_frame_params_v2 image_frame_params[];  20 bytes each
++ *   };
++ *
++ * v2 has the same header with 16-byte struct fp_image_frame_params entries.
++ * The EC always writes FP_MAX_CAPTURE_TYPES (10) entries for v2/v3 and
++ * fails with EC_RES_OVERFLOW if the host buffer is smaller.
++ * Source: chromiumos/platform/ec include/ec_commands.h and
++ * common/fpsensor/fpsensor.cc fp_command_info().
++ */
++
++#pragma once
++
++#include <glib.h>
++
++G_BEGIN_DECLS
++
++/* Generic EC command: get the supported versions of another command (v1
++ * takes a 16-bit command number). */
++#define CRFPMOC_EC_CMD_GET_CMD_VERSIONS 0x0008
++
++#define CRFPMOC_FP_MAX_CAPTURE_TYPES 10
++/* enum fp_capture_type: the format used for enrollment/matching */
++#define CRFPMOC_FP_CAPTURE_VENDOR_FORMAT 0
++
++#define CRFPMOC_FP_INFO_V1_SIZE 48
++#define CRFPMOC_FP_INFO_V2_HEADER_SIZE 36 /* fp_sensor_info + fp_template_info */
++#define CRFPMOC_FP_INFO_V2_FRAME_SIZE 16  /* struct fp_image_frame_params */
++#define CRFPMOC_FP_INFO_V3_FRAME_SIZE 20  /* struct fp_image_frame_params_v2 */
++
++struct crfpmoc_ec_params_get_cmd_versions_v1
++{
++  guint16 cmd;
++} __attribute__((packed));
++
++struct crfpmoc_ec_response_get_cmd_versions
++{
++  guint32 version_mask;
++} __attribute__((packed));
++
++/* Version independent view of an FP_INFO response */
++typedef struct
++{
++  guint32  vendor_id;
++  guint32  product_id;
++  guint32  model_id;
++  guint32  version;
++  guint16  errors;
++  guint16  num_capture_types; /* 1 for v1 */
++
++  guint32  template_size;    /* max template size in bytes */
++  guint16  template_max;     /* maximum number of fingers/templates */
++  guint16  template_valid;   /* number of valid fingers/templates */
++  guint32  template_dirty;   /* bitmap of templates with MCU side changes */
++  guint32  template_version; /* version of the template format */
++
++  /* Frame parameters of the vendor-format capture (v1: the only frame).
++   * Informational only: the driver does not capture images. */
++  gboolean has_frame;
++  guint8   capture_type;
++  guint32  frame_size;
++  guint32  pixel_format;
++  guint16  width;
++  guint16  height;
++  guint16  bpp;
++} CrfpMocFpInfo;
++
++/* Highest FP_INFO version this driver can parse in an
++ * EC_CMD_GET_CMD_VERSIONS mask (3, 2 or 1), or -1 if none. */
++int crfpmoc_fp_info_pick_version (guint32 version_mask);
++
++/* Response buffer size to request for FP_INFO @version, 0 if unsupported. */
++gsize crfpmoc_fp_info_response_size (int version);
++
++/* Parse the @len bytes received for FP_INFO @version into @info. Errors are
++ * in the G_IO_ERROR domain. */
++gboolean crfpmoc_fp_info_parse (int            version,
++                                const guint8  *buf,
++                                gsize          len,
++                                CrfpMocFpInfo *info,
++                                GError       **error);
++
++G_END_DECLS
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.c b/libfprint/drivers/crfpmoc/crfpmoc.c
+index eed034fa..b4475868 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc.c
+@@ -28,6 +28,7 @@
+ 
+ #include "crfpmoc.h"
+ #include "crfpmoc-ec-transfer.h"
++#include "crfpmoc-fp-info.h"
+ 
+ struct _FpiDeviceCrfpMoc
+ {
+@@ -38,6 +39,7 @@ struct _FpiDeviceCrfpMoc
+   guint16  max_outsize;
+   guint16  max_templates;
+   guint16  template_size;
++  int      fp_info_version; /* EC_CMD_FP_INFO version to use (1, 2 or 3) */
+ 
+   guint8   seed[CRFPMOC_FP_CONTEXT_TPM_BYTES];
+   guint8   context[CRFPMOC_FP_CONTEXT_USERID_BYTES];
+@@ -733,15 +735,48 @@ crfpmoc_clear_storage_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoint
+     }
+ }
+ 
++/* New EC_CMD_FP_INFO transfer using the version negotiated at open, with the
++ * response buffer sized for that version (v2/v3 include all frame entries,
++ * the EC refuses smaller buffers). */
++static CrfpMocEcTransfer *
++crfpmoc_fp_info_transfer_new (FpDevice *device)
++{
++  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
++  int version = self->fp_info_version ? self->fp_info_version : 1;
++
++  return crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, version,
++                                      NULL, 0,
++                                      crfpmoc_fp_info_response_size (version));
++}
++
++/* Parse a completed FP_INFO transfer. */
++static gboolean
++crfpmoc_fp_info_from_transfer (CrfpMocEcTransfer *transfer,
++                               CrfpMocFpInfo     *info,
++                               GError           **error)
++{
++  g_autoptr(GError) local_error = NULL;
++
++  if (!crfpmoc_fp_info_parse (transfer->version, transfer->indata,
++                              MAX (transfer->inlen, 0), info, &local_error))
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "%s", local_error->message);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
+ /* Parse the device info response, vendor, version, etc. Get the state
+  * of the loaded templates and how many can be loaded as well as the
+  * size of templates. All templates have the same size on a given device.
+  */
+ static gboolean
+-crfpmoc_parse_fp_info (struct crfpmoc_ec_response_fp_info *r,
+-                       guint16                            *max_templates,
+-                       guint16                            *template_size,
+-                       GError                            **error)
++crfpmoc_parse_fp_info (const CrfpMocFpInfo *r,
++                       guint16             *max_templates,
++                       guint16             *template_size,
++                       GError             **error)
+ {
+   gchar vendor[5];
+   const gchar *model = NULL;
+@@ -771,7 +806,11 @@ crfpmoc_parse_fp_info (struct crfpmoc_ec_response_fp_info *r,
+     }
+   fp_dbg ("Fingerprint sensor: vendor %s product %x model %x (%s) version %x",
+           vendor, r->product_id, r->model_id, model ? model : "", r->version);
+-  fp_dbg ("Image: size %dx%d %d bpp", r->width, r->height, r->bpp);
++  if (r->has_frame)
++    fp_dbg ("Image: size %dx%d %d bpp, frame %u bytes, capture type %u of %u",
++            r->width, r->height, r->bpp, r->frame_size, r->capture_type,
++            r->num_capture_types);
++  fp_dbg ("Sensor errors: 0x%04x", r->errors);
+   fp_dbg ("Templates: version %d size %d count %d/%d dirty bitmap %x",
+           r->template_version, r->template_size, r->template_valid,
+           r->template_max, r->template_dirty);
+@@ -959,6 +998,69 @@ crfpmoc_open_proto_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
+   fpi_ssm_next_state (ssm);
+ }
+ 
++static void
++crfpmoc_open_fp_info_versions_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
++{
++  g_autoptr(GError) error = NULL;
++  FpiSsm *ssm = user_data;
++  FpDevice *device = fpi_ssm_get_device (ssm);
++  FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
++  struct crfpmoc_ec_response_get_cmd_versions *r = transfer->indata;
++  gsize size;
++  int version;
++
++  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
++    {
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++        {
++          fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
++          return;
++        }
++
++      /* Every cros_ec firmware implements GET_CMD_VERSIONS v1, but do not
++       * fail hard: fall back to the historical FP_INFO v1. */
++      fp_warn ("Could not query FP_INFO versions (%s), assuming v1", error->message);
++      self->fp_info_version = 1;
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  if (transfer->inlen < (int) sizeof (*r))
++    {
++      fp_warn ("Short GET_CMD_VERSIONS response, assuming FP_INFO v1");
++      self->fp_info_version = 1;
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  version = crfpmoc_fp_info_pick_version (GUINT32_FROM_LE (r->version_mask));
++  fp_dbg ("FP_INFO version mask 0x%x, using v%d",
++          GUINT32_FROM_LE (r->version_mask), version);
++
++  if (version < 0)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                                     "FPMCU supports no known FP_INFO version (mask 0x%x)",
++                                                     GUINT32_FROM_LE (r->version_mask)));
++      return;
++    }
++
++  size = crfpmoc_fp_info_response_size (version);
++  if (size > self->max_insize)
++    {
++      fpi_ssm_mark_failed (ssm,
++                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                     "FP_INFO v%d response (%" G_GSIZE_FORMAT
++                                                     " bytes) exceeds max response payload %u",
++                                                     version, size, self->max_insize));
++      return;
++    }
++
++  self->fp_info_version = version;
++  fpi_ssm_next_state (ssm);
++}
++
+ static void
+ crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer user_data)
+ {
+@@ -966,7 +1068,7 @@ crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
+   FpiSsm *ssm = user_data;
+   FpDevice *device = fpi_ssm_get_device (ssm);
+   FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+-  struct crfpmoc_ec_response_fp_info *info;
++  CrfpMocFpInfo info;
+ 
+   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
+     {
+@@ -975,9 +1077,8 @@ crfpmoc_open_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointe
+       return;
+     }
+ 
+-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+-
+-  if (!crfpmoc_parse_fp_info (info, &self->max_templates,
++  if (!crfpmoc_fp_info_from_transfer (transfer, &info, &error) ||
++      !crfpmoc_parse_fp_info (&info, &self->max_templates,
+                               &self->template_size, &error))
+     {
+       g_prefix_error_literal (&error, "Failed to get max templates and templates size: ");
+@@ -1002,9 +1103,21 @@ crfpmoc_open_run_state (FpiSsm *ssm, FpDevice *device)
+                                       crfpmoc_open_proto_info_cb, ssm);
+       break;
+ 
++    case OPEN_GET_FP_INFO_VERSIONS:
++      {
++        struct crfpmoc_ec_params_get_cmd_versions_v1 p = {
++          .cmd = GUINT16_TO_LE (CRFPMOC_EC_CMD_FP_INFO),
++        };
++        transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_GET_CMD_VERSIONS, 1,
++                                                &p, sizeof (p),
++                                                sizeof (struct crfpmoc_ec_response_get_cmd_versions));
++        crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
++                                        crfpmoc_open_fp_info_versions_cb, ssm);
++        break;
++      }
++
+     case OPEN_GET_FP_INFO:
+-      transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
+-                                              NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
++      transfer = crfpmoc_fp_info_transfer_new (device);
+       crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                       crfpmoc_open_fp_info_cb, ssm);
+       break;
+@@ -1160,10 +1273,11 @@ crfpmoc_commit_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
+   FpiDeviceCrfpMoc *self = FPI_DEVICE_CRFPMOC (device);
+   DownloadData *ddata;
+   FpiSsm *sub;
+-  struct crfpmoc_ec_response_fp_info *info;
++  CrfpMocFpInfo info;
+   guint16 enrolled_templates;
+ 
+-  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
++  if (!crfpmoc_ec_transfer_submit_finish (res, &error) ||
++      !crfpmoc_fp_info_from_transfer (transfer, &info, &error))
+     {
+       fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                           "Failed to get FP info: %s",
+@@ -1171,8 +1285,7 @@ crfpmoc_commit_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
+       return;
+     }
+ 
+-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+-  enrolled_templates = info->template_valid;
++  enrolled_templates = info.template_valid;
+   fp_dbg ("Number of enrolled templates is: %d", enrolled_templates);
+ 
+   if (enrolled_templates == 0)
+@@ -1203,17 +1316,17 @@ crfpmoc_verify_fp_info_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoin
+   CrfpMocEcTransfer *stats_transfer;
+   FpiSsm *ssm = user_data;
+   FpDevice *device = fpi_ssm_get_device (ssm);
+-  struct crfpmoc_ec_response_fp_info *info;
++  CrfpMocFpInfo info;
+   guint16 enrolled_templates;
+ 
+-  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
++  if (!crfpmoc_ec_transfer_submit_finish (res, &error) ||
++      !crfpmoc_fp_info_from_transfer (transfer, &info, &error))
+     {
+       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+       return;
+     }
+ 
+-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+-  enrolled_templates = info->template_valid;
++  enrolled_templates = info.template_valid;
+ 
+   fp_dbg ("handle_verify_check: enrolled templates: %d", enrolled_templates);
+ 
+@@ -1422,8 +1535,7 @@ handle_enroll_commit (FpiSsm *ssm)
+   FpDevice *device = fpi_ssm_get_device (ssm);
+   CrfpMocEcTransfer *transfer;
+ 
+-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
+-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
++  transfer = crfpmoc_fp_info_transfer_new (device);
+   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                   crfpmoc_commit_fp_info_cb, ssm);
+ }
+@@ -1433,15 +1545,16 @@ crfpmoc_enroll_capacity_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
+ {
+   g_autoptr(GError) error = NULL;
+   FpiSsm *ssm = user_data;
+-  struct crfpmoc_ec_response_fp_info *info;
++  CrfpMocFpInfo fp_info;
++  CrfpMocFpInfo *info = &fp_info;
+ 
+-  if (!crfpmoc_ec_transfer_submit_finish (res, &error))
++  if (!crfpmoc_ec_transfer_submit_finish (res, &error) ||
++      !crfpmoc_fp_info_from_transfer (transfer, &fp_info, &error))
+     {
+       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+       return;
+     }
+ 
+-  info = (struct crfpmoc_ec_response_fp_info *) transfer->indata;
+   fp_dbg ("handle_enroll_check_capacity: enrolled %d of %d templates",
+           info->template_valid, info->template_max);
+ 
+@@ -1465,8 +1578,7 @@ handle_enroll_check_capacity (FpiSsm *ssm)
+   FpDevice *device = fpi_ssm_get_device (ssm);
+   CrfpMocEcTransfer *transfer;
+ 
+-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
+-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
++  transfer = crfpmoc_fp_info_transfer_new (device);
+   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                   crfpmoc_enroll_capacity_cb, ssm);
+ }
+@@ -1714,8 +1826,7 @@ handle_verify_check (FpiSsm *ssm)
+   FpDevice *device = fpi_ssm_get_device (ssm);
+   CrfpMocEcTransfer *transfer;
+ 
+-  transfer = crfpmoc_ec_transfer_new_cmd (device, CRFPMOC_EC_CMD_FP_INFO, 1,
+-                                          NULL, 0, sizeof (struct crfpmoc_ec_response_fp_info));
++  transfer = crfpmoc_fp_info_transfer_new (device);
+   crfpmoc_ec_transfer_submit_cmd (transfer, fpi_device_get_cancellable (device),
+                                   crfpmoc_verify_fp_info_cb, ssm);
+ }
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.h b/libfprint/drivers/crfpmoc/crfpmoc.h
+index 2bc31831..b845e025 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.h
++++ b/libfprint/drivers/crfpmoc/crfpmoc.h
+@@ -220,6 +220,7 @@ struct crfpmoc_ec_params_fp_context_v1
+   guint32 userid[CRFPMOC_FP_CONTEXT_USERID_WORDS];
+ } __attribute__((packed));
+ 
++/* FP_INFO v1 layout; parsed by crfpmoc-fp-info.c, kept for reference */
+ struct crfpmoc_ec_response_fp_info
+ {
+   /* Sensor identification */
+@@ -446,8 +447,9 @@ enum crfpmoc_ec_status {
+ /* Open state machine states
+  */
+ enum {
+-  OPEN_GET_PROTO_INFO, /* Query protocol info (max in/out sizes) */
+-  OPEN_GET_FP_INFO,    /* Query fingerprint sensor info */
++  OPEN_GET_PROTO_INFO,       /* Query protocol info (max in/out sizes) */
++  OPEN_GET_FP_INFO_VERSIONS, /* Query supported FP_INFO versions */
++  OPEN_GET_FP_INFO,          /* Query fingerprint sensor info */
+   OPEN_STATES,
+ };
+ 
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 402cd43b..b40e7524 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -105,6 +105,7 @@ driver_sources = {
+     'crfpmoc' : files(
+         'drivers/crfpmoc/crfpmoc.c',
+         'drivers/crfpmoc/crfpmoc-ec-transfer.c',
++        'drivers/crfpmoc/crfpmoc-fp-info.c',
+     ),
+     'vcom5s' : files('drivers/vcom5s.c'),
+     'vfs101' : files('drivers/vfs101.c'),
+diff --git a/tests/crfpmoc-v3/custom.ioctl b/tests/crfpmoc-v3/custom.ioctl
+new file mode 100644
+index 00000000..e07c91a1
+--- /dev/null
++++ b/tests/crfpmoc-v3/custom.ioctl
+@@ -0,0 +1,362 @@
++@DEV /dev/cros_fp
++CROS_EC_DEV_IOCXCMD_V2 12 000000000B000000000000000C00000000000000080000002002200201000000
++CROS_EC_DEV_IOCXCMD_V2 4 010000000800000002000000040000000000000008000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050000000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000A0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000009C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F9091929394959697
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000098999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F90919293
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000009495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000008C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F8081828384858687
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000088898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F80818283
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000008485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000007C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F7071727374757677
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000078797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F70717273
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000007475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000006C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F6061626364656667
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000068696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F60616263
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000006465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000005C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F5051525354555657
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000058595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F50515253
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000005455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F
++CROS_EC_DEV_IOCXCMD_V2 116 0000000004040000080000007400000000000000505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000004000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000040000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050000000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050000000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000A0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000009C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F9091929394959697
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000098999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F90919293
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000009495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000008C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F8081828384858687
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000088898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F80818283
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000008485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000007C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F7071727374757677
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000078797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F70717273
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000007475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000006C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F6061626364656667
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000068696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F60616263
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000006465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000005C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F5051525354555657
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000058595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F50515253
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000005455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F
++CROS_EC_DEV_IOCXCMD_V2 116 0000000004040000080000007400000000000000505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000004000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000040000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 22 0000000007040000000000001600000000000000E8030000F4010000D007000040420F00000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000004000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000040000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 22 0000000007040000000000001600000000000000E8030000F4010000D007000040420F00000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050000000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000030000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000004C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F4041424344454647
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000048494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F40414243
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000004445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000003C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000038393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F30313233
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000003435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000002C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F2021222324252627
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000028292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F20212223
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000002425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F101112131415161718191A1B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000001C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F1011121314151617
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000018191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F10111213
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000001415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B0C0D0E0F
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC00000000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF000102030405060708090A0B
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000000C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF0001020304050607
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC0000000000000008090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF00010203
++CROS_EC_DEV_IOCXCMD_V2 252 000000000404000008000000FC000000000000000405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F707172737475767778797A7B7C7D7E7F808182838485868788898A8B8C8D8E8F909192939495969798999A9B9C9D9E9FA0A1A2A3A4A5A6A7A8A9AAABACADAEAFB0B1B2B3B4B5B6B7B8B9BABBBCBDBEBFC0C1C2C3C4C5C6C7C8C9CACBCCCDCECFD0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE0E1E2E3E4E5E6E7E8E9EAEBECEDEEEFF0F1F2F3F4F5F6F7F8F9FAFBFCFDFEFF
++CROS_EC_DEV_IOCXCMD_V2 116 0000000004040000080000007400000000000000000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F303132333435363738393A3B3C3D3E3F404142434445464748494A4B4C4D4E4F505152535455565758595A5B5C5D5E5F606162636465666768696A6B6C6D6E6F70717273
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000004000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000040000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 22 0000000007040000000000001600000000000000E8030000F4010000D007000040420F00000000000200
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000004000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
++CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000005040000F80000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 00000000050400007C0000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000040000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050001000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 22 0000000007040000000000001600000000000000E8030000F4010000D007000040420F00000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
++CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
+diff --git a/tests/crfpmoc-v3/custom.py b/tests/crfpmoc-v3/custom.py
+new file mode 100755
+index 00000000..a688b99b
+--- /dev/null
++++ b/tests/crfpmoc-v3/custom.py
+@@ -0,0 +1,160 @@
++#!/usr/bin/python3
++
++import traceback
++import sys
++import gi
++
++gi.require_version('FPrint', '2.0')
++from gi.repository import FPrint, GLib
++
++# Exit with error on any exception, included those happening in async callbacks
++sys.excepthook = lambda *args: (traceback.print_exception(*args), sys.exit(1))
++
++ctx = GLib.main_context_default()
++
++c = FPrint.Context()
++c.enumerate()
++devices = c.get_devices()
++
++d = devices[0]
++del devices
++
++assert d.get_driver() == "crfpmoc"
++assert not d.has_feature(FPrint.DeviceFeature.CAPTURE)
++assert d.has_feature(FPrint.DeviceFeature.IDENTIFY)
++assert d.has_feature(FPrint.DeviceFeature.VERIFY)
++assert not d.has_feature(FPrint.DeviceFeature.DUPLICATES_CHECK)
++assert not d.has_feature(FPrint.DeviceFeature.STORAGE)
++assert not d.has_feature(FPrint.DeviceFeature.STORAGE_LIST)
++assert not d.has_feature(FPrint.DeviceFeature.STORAGE_DELETE)
++assert d.has_feature(FPrint.DeviceFeature.STORAGE_CLEAR)
++
++d.open_sync()
++
++
++def enroll_progress(*args):
++    print("finger status: ", d.get_finger_status())
++    print('enroll progress: ' + str(args))
++
++
++def enroll_finger(finger):
++    template = FPrint.Print.new(d)
++    template.set_finger(finger)
++    print("enrolling", finger)
++    assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++    p = d.enroll_sync(template, None, enroll_progress, None)
++    assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++    print("enroll done:", p)
++    return p
++
++def identify_done(dev, res):
++    global identified
++    identified = True
++    identify_match, identify_print = dev.identify_finish(res)
++    print('identification_done: ', identify_match, identify_print)
++    assert identify_match is not None
++    assert identify_print is not None
++    assert identify_match != identify_print
++    assert identify_match == deserialized_prints[-1]
++    assert identify_match.equal(identify_print)
++
++
++# clear, identify (nothing enrolled), enroll, verify, identify (bad gallery),
++# enroll another finger, verify the first, clear
++
++print("clear device storage")
++d.clear_storage_sync()
++print("clear done")
++
++# Enroll a first finger up front so we have valid, uploadable prints to build
++# galleries from. (A print with no template data cannot be uploaded to the
++# sensor, so identify galleries must carry real template data.)
++p1 = enroll_finger(FPrint.Finger.LEFT_INDEX)
++
++gallery_a = [FPrint.Print.deserialize(p1.serialize())]
++
++# Identify while the device store is empty: clear the device and identify a
++# gallery of valid prints. The device reports no enrolled templates, so no
++# match is reported (and no error is raised).
++print("clear device storage")
++d.clear_storage_sync()
++print("clear done")
++
++print('identifying with nothing enrolled')
++identify_match, identify_print = d.identify_sync(gallery_a)
++print('identification (empty store) done:', identify_match, identify_print)
++assert identify_match is None
++del gallery_a
++
++# Re-enroll the first finger so the device has it stored again, then verify.
++p1 = enroll_finger(FPrint.Finger.LEFT_INDEX)
++
++print("verifying first finger")
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++verify_res, verify_print = d.verify_sync(p1)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("verify done:", verify_res, verify_print)
++assert verify_res == True
++assert verify_print is not None
++assert p1 != verify_print
++assert verify_print.equal(p1)
++
++# Identify (async) finger A against a gallery that contains it: a match must
++# be reported and the scanned print must equal the matched gallery entry.
++identified = False
++deserialized_prints = [FPrint.Print.deserialize(p1.serialize())]
++assert deserialized_prints[-1].equal(p1)
++
++print('async identifying')
++d.identify(deserialized_prints, callback=identify_done)
++while not identified:
++    ctx.iteration(True)
++del deserialized_prints
++
++# Identify against a gallery of prints whose finger the sensor does not
++# match: no gallery entry corresponds to the scanned finger, so no match is
++# reported. The gallery entries carry valid (but different) template data so
++# they can still be uploaded to the sensor.
++identified = False
++identify_result = None
++
++
++def identify_no_match_done(dev, res):
++    global identified, identify_result
++    identified = True
++    identify_result = dev.identify_finish(res)
++
++
++p2 = enroll_finger(FPrint.Finger.RIGHT_INDEX)
++assert not p1.equal(p2)
++not_enrolled_gallery = [FPrint.Print.deserialize(p2.serialize()) for _ in range(3)]
++
++print('identifying with a non-matching gallery')
++d.identify(not_enrolled_gallery, callback=identify_no_match_done)
++while not identified:
++    ctx.iteration(True)
++identify_match, identify_print = identify_result
++print('identification (non-matching gallery) done:', identify_match, identify_print)
++assert identify_match is None
++del not_enrolled_gallery
++
++print("verifying first finger again")
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++verify_res, verify_print = d.verify_sync(p1)
++assert d.get_finger_status() == FPrint.FingerStatusFlags.NONE
++print("verify (after second enroll) done:", verify_res, verify_print)
++assert verify_res == True
++assert verify_print is not None
++assert verify_print.equal(p1)
++
++del p1
++del p2
++
++print("clear device storage")
++d.clear_storage_sync()
++print("clear done")
++
++d.close_sync()
++
++del d
++del c
+diff --git a/tests/crfpmoc-v3/device b/tests/crfpmoc-v3/device
+new file mode 100644
+index 00000000..15524ac1
+--- /dev/null
++++ b/tests/crfpmoc-v3/device
+@@ -0,0 +1,205 @@
++P: /devices/pci0000:00/0000:00:1e.3/pxa2xx-spi.8/spi_master/spi1/spi-PRP0001:01/cros-ec-dev.2.auto/misc/cros_fp
++N: cros_fp
++E: DEVNAME=/dev/cros_fp
++E: MAJOR=10
++E: MINOR=120
++E: SUBSYSTEM=misc
++A: dev=10:120\n
++L: device=../../../cros-ec-dev.2.auto
++A: power/async=disabled\n
++A: power/control=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=0\n
++A: power/runtime_enabled=disabled\n
++A: power/runtime_status=unsupported\n
++A: power/runtime_suspended_time=0\n
++A: power/runtime_usage=0\n
++
++P: /devices/pci0000:00/0000:00:1e.3/pxa2xx-spi.8/spi_master/spi1/spi-PRP0001:01/cros-ec-dev.2.auto
++E: DRIVER=cros-ec-dev
++E: ID_PATH=pci-0000:00:1e.3-platform-pxa2xx-spi.8-cs-01-platform-cros-ec-dev.2.auto
++E: ID_PATH_TAG=pci-0000_00_1e_3-platform-pxa2xx-spi_8-cs-01-platform-cros-ec-dev_2_auto
++E: MODALIAS=platform:cros-ec-dev
++E: SUBSYSTEM=platform
++L: driver=../../../../../../../../bus/platform/drivers/cros-ec-dev
++A: driver_override=(null)\n
++A: modalias=platform:cros-ec-dev\n
++A: power/async=disabled\n
++A: power/control=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=0\n
++A: power/runtime_enabled=disabled\n
++A: power/runtime_status=unsupported\n
++A: power/runtime_suspended_time=0\n
++A: power/runtime_usage=0\n
++
++P: /devices/pci0000:00/0000:00:1e.3/pxa2xx-spi.8/spi_master/spi1/spi-PRP0001:01
++E: DRIVER=cros-ec-spi
++E: MODALIAS=of:NcrfpTCgoogle,cros-ec-spi
++E: SUBSYSTEM=spi
++L: driver=../../../../../../../bus/spi/drivers/cros-ec-spi
++A: driver_override=\n
++L: firmware_node=../../../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:1b/PRP0001:01
++A: modalias=of:NcrfpTCgoogle,cros-ec-spi\n
++A: power/async=disabled\n
++A: power/control=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=0\n
++A: power/runtime_enabled=disabled\n
++A: power/runtime_status=unsupported\n
++A: power/runtime_suspended_time=0\n
++A: power/runtime_usage=0\n
++A: power/wakeup=enabled\n
++A: power/wakeup_abort_count=0\n
++A: power/wakeup_active=0\n
++A: power/wakeup_active_count=1779\n
++A: power/wakeup_count=0\n
++A: power/wakeup_expire_count=0\n
++A: power/wakeup_last_time_ms=370430567\n
++A: power/wakeup_max_time_ms=0\n
++A: power/wakeup_total_time_ms=0\n
++A: statistics/bytes=8559778\n
++A: statistics/bytes_rx=8559778\n
++A: statistics/bytes_tx=2021451\n
++A: statistics/errors=0\n
++A: statistics/messages=304844\n
++A: statistics/spi_async=0\n
++A: statistics/spi_sync=304844\n
++A: statistics/spi_sync_immediate=304844\n
++A: statistics/timedout=0\n
++A: statistics/transfer_bytes_histo_0-1=60993\n
++A: statistics/transfer_bytes_histo_1024-2047=0\n
++A: statistics/transfer_bytes_histo_128-255=1510\n
++A: statistics/transfer_bytes_histo_16-31=2901\n
++A: statistics/transfer_bytes_histo_16384-32767=0\n
++A: statistics/transfer_bytes_histo_2-3=862\n
++A: statistics/transfer_bytes_histo_2048-4095=0\n
++A: statistics/transfer_bytes_histo_256-511=6196\n
++A: statistics/transfer_bytes_histo_32-63=175509\n
++A: statistics/transfer_bytes_histo_32768-65535=0\n
++A: statistics/transfer_bytes_histo_4-7=2039\n
++A: statistics/transfer_bytes_histo_4096-8191=0\n
++A: statistics/transfer_bytes_histo_512-1023=711\n
++A: statistics/transfer_bytes_histo_64-127=760\n
++A: statistics/transfer_bytes_histo_65536+=0\n
++A: statistics/transfer_bytes_histo_8-15=53363\n
++A: statistics/transfer_bytes_histo_8192-16383=0\n
++A: statistics/transfers=304844\n
++A: statistics/transfers_split_maxsize=0\n
++
++P: /devices/pci0000:00/0000:00:1e.3/pxa2xx-spi.8/spi_master/spi1
++E: SUBSYSTEM=spi_master
++L: device=../../../pxa2xx-spi.8
++L: firmware_node=../../../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:1b
++A: power/async=disabled\n
++A: power/control=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=0\n
++A: power/runtime_enabled=disabled\n
++A: power/runtime_status=unsupported\n
++A: power/runtime_suspended_time=0\n
++A: power/runtime_usage=0\n
++L: software_node=../../../../../../kernel/software_nodes/node3
++A: statistics/bytes=8559778\n
++A: statistics/bytes_rx=8559778\n
++A: statistics/bytes_tx=2021451\n
++A: statistics/errors=0\n
++A: statistics/messages=304844\n
++A: statistics/spi_async=0\n
++A: statistics/spi_sync=304844\n
++A: statistics/spi_sync_immediate=304844\n
++A: statistics/timedout=0\n
++A: statistics/transfer_bytes_histo_0-1=60993\n
++A: statistics/transfer_bytes_histo_1024-2047=0\n
++A: statistics/transfer_bytes_histo_128-255=1510\n
++A: statistics/transfer_bytes_histo_16-31=2901\n
++A: statistics/transfer_bytes_histo_16384-32767=0\n
++A: statistics/transfer_bytes_histo_2-3=862\n
++A: statistics/transfer_bytes_histo_2048-4095=0\n
++A: statistics/transfer_bytes_histo_256-511=6196\n
++A: statistics/transfer_bytes_histo_32-63=175509\n
++A: statistics/transfer_bytes_histo_32768-65535=0\n
++A: statistics/transfer_bytes_histo_4-7=2039\n
++A: statistics/transfer_bytes_histo_4096-8191=0\n
++A: statistics/transfer_bytes_histo_512-1023=711\n
++A: statistics/transfer_bytes_histo_64-127=760\n
++A: statistics/transfer_bytes_histo_65536+=0\n
++A: statistics/transfer_bytes_histo_8-15=53363\n
++A: statistics/transfer_bytes_histo_8192-16383=0\n
++A: statistics/transfers=304844\n
++A: statistics/transfers_split_maxsize=0\n
++A: waiting_for_supplier=0\n
++
++P: /devices/pci0000:00/0000:00:1e.3/pxa2xx-spi.8
++E: DEVTYPE=mfd_device
++E: DRIVER=pxa2xx-spi
++E: ID_PATH=pci-0000:00:1e.3-platform-pxa2xx-spi.8
++E: ID_PATH_TAG=pci-0000_00_1e_3-platform-pxa2xx-spi_8
++E: MODALIAS=platform:pxa2xx-spi
++E: SUBSYSTEM=platform
++L: driver=../../../../bus/platform/drivers/pxa2xx-spi
++A: driver_override=(null)\n
++L: firmware_node=../../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:1b
++A: modalias=platform:pxa2xx-spi\n
++A: power/async=disabled\n
++A: power/autosuspend_delay_ms=50\n
++A: power/control=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=2600804\n
++A: power/runtime_enabled=enabled\n
++A: power/runtime_status=suspended\n
++A: power/runtime_suspended_time=368046223\n
++A: power/runtime_usage=0\n
++L: software_node=../../../../kernel/software_nodes/node3
++
++P: /devices/pci0000:00/0000:00:1e.3
++E: DRIVER=intel-lpss
++E: ID_MODEL_FROM_DATABASE=Tiger Lake-LP Serial IO SPI Controller
++E: ID_PATH=pci-0000:00:1e.3
++E: ID_PATH_TAG=pci-0000_00_1e_3
++E: ID_PCI_CLASS_FROM_DATABASE=Serial bus controller
++E: ID_PCI_SUBCLASS_FROM_DATABASE=Serial bus controller
++E: ID_VENDOR_FROM_DATABASE=Intel Corporation
++E: MODALIAS=pci:v00008086d0000A0ABsv00008086sd00007270bc0Csc80i00
++E: PCI_CLASS=C8000
++E: PCI_ID=8086:A0AB
++E: PCI_SLOT_NAME=0000:00:1e.3
++E: PCI_SUBSYS_ID=8086:7270
++E: SUBSYSTEM=pci
++A: ari_enabled=0\n
++A: broken_parity_status=0\n
++A: class=0x0c8000\n
++H: config=8680ABA0060010002000800C100080000450F57F00000000000000000000000000000000000000000000000086807072000000008000000000000000FF04000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000019003000B0000000000000000000000090014F01000400101210000C124000000080F00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000B50F210100000000
++A: consistent_dma_mask_bits=64\n
++A: d3cold_allowed=1\n
++A: device=0xa0ab\n
++A: dma_mask_bits=32\n
++L: driver=../../../bus/pci/drivers/intel-lpss
++A: driver_override=(null)\n
++A: enable=1\n
++L: firmware_node=../../LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:1b
++L: iommu=../../virtual/iommu/dmar1
++L: iommu_group=../../../kernel/iommu_groups/13
++A: irq=37\n
++A: local_cpulist=0-7\n
++A: local_cpus=ff\n
++A: modalias=pci:v00008086d0000A0ABsv00008086sd00007270bc0Csc80i00\n
++A: msi_bus=1\n
++A: numa_node=-1\n
++A: pools=poolinfo - 0.1\ndma8chan1           0  102   40  1\ndma8chan0           0  102   40  1\n
++A: power/async=enabled\n
++A: power/control=auto\n
++A: power/pm_qos_latency_tolerance_us=auto\n
++A: power/runtime_active_kids=0\n
++A: power/runtime_active_time=3636822\n
++A: power/runtime_enabled=enabled\n
++A: power/runtime_status=suspended\n
++A: power/runtime_suspended_time=367013193\n
++A: power/runtime_usage=0\n
++A: power_state=D3hot\n
++A: resource=0x000000007ff55000 0x000000007ff55fff 0x0000000000140204\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n
++A: revision=0x20\n
++A: subsystem_device=0x7270\n
++A: subsystem_vendor=0x8086\n
++A: vendor=0x8086\n
++
+diff --git a/tests/crfpmoc/custom.ioctl b/tests/crfpmoc/custom.ioctl
+index 80404765..8db529b6 100644
+--- a/tests/crfpmoc/custom.ioctl
++++ b/tests/crfpmoc/custom.ioctl
+@@ -1,5 +1,6 @@
+ @DEV /dev/cros_fp
+ CROS_EC_DEV_IOCXCMD_V2 12 000000000B000000000000000C00000000000000080000002002200201000000
++CROS_EC_DEV_IOCXCMD_V2 4 010000000800000002000000040000000000000003000000
+ CROS_EC_DEV_IOCXCMD_V2 48 010000000304000000000000300000000000000046504320090000001F020000010000009466000047524559A000A0000800FF0324140000050001000100000004000000
+ CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
+ CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
+diff --git a/tests/meson.build b/tests/meson.build
+index 35363291..16928edb 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -36,6 +36,7 @@ drivers_tests = {
+     'aes2550': {},
+     'aes3500': {},
+     'crfpmoc': {},
++    'crfpmoc-v3': {},
+     'elan': {},
+     'elan-cobo': {},
+     'elanmoc': {},
+@@ -378,6 +379,27 @@ foreach test_name: unit_tests
+     )
+ endforeach
+ 
++# Device independent crfpmoc helpers, built straight from the driver sources
++if 'crfpmoc' in drivers
++    crfpmoc_unit_tests = {
++        'crfpmoc-fp-info': files('../libfprint/drivers/crfpmoc/crfpmoc-fp-info.c'),
++    }
++    foreach test_name, test_sources: crfpmoc_unit_tests
++        test_exe = executable('test-' + test_name,
++            sources: ['test-' + test_name + '.c'] + test_sources,
++            include_directories: include_directories('../libfprint/drivers/crfpmoc'),
++            dependencies: [glib_dep, gio_dep],
++            c_args: common_cflags,
++            install: false,
++        )
++        test(test_name,
++            test_exe,
++            suite: ['unit-tests'],
++            env: envs,
++        )
++    endforeach
++endif
++
+ # Run udev rule generator with fatal warnings
+ hwdb_envs = envs
+ hwdb_envs.set('UDEV_HWDB', udev_hwdb.full_path())
+diff --git a/tests/test-crfpmoc-fp-info.c b/tests/test-crfpmoc-fp-info.c
+new file mode 100644
+index 00000000..fd2176aa
+--- /dev/null
++++ b/tests/test-crfpmoc-fp-info.c
+@@ -0,0 +1,268 @@
++/*
++ * Unit tests for the crfpmoc EC_CMD_FP_INFO parser
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++#include <gio/gio.h>
++
++#include "crfpmoc-fp-info.h"
++
++static void
++put16 (guint8 *p, guint16 v)
++{
++  p[0] = v & 0xff;
++  p[1] = v >> 8;
++}
++
++static void
++put32 (guint8 *p, guint32 v)
++{
++  for (int i = 0; i < 4; i++)
++    p[i] = (v >> (8 * i)) & 0xff;
++}
++
++/* Header shared by v2 and v3 */
++static void
++fill_header (guint8 *b, guint16 num_capture_types)
++{
++  put32 (b + 0, 0x20534745);  /* vendor "EGS " */
++  put32 (b + 4, 0x00000171);  /* product */
++  put32 (b + 8, 0x00000660);  /* model */
++  put32 (b + 12, 0x00000001); /* version */
++  put16 (b + 16, num_capture_types);
++  put16 (b + 18, 0x0003);     /* errors */
++  put32 (b + 20, 5156);       /* template_size */
++  put16 (b + 24, 5);          /* template_max */
++  put16 (b + 26, 2);          /* template_valid */
++  put32 (b + 28, 0x2);        /* template_dirty */
++  put32 (b + 32, 4);          /* template_version */
++}
++
++static void
++fill_v3_frame (guint8 *f, guint32 frame_size, guint16 w, guint16 h, guint8 type)
++{
++  put32 (f + 0, frame_size);
++  put32 (f + 4, 0x40);        /* image_data_offset_bytes */
++  put32 (f + 8, 0x59455247);  /* V4L2 GREY */
++  put16 (f + 12, w);
++  put16 (f + 14, h);
++  put16 (f + 16, 8);
++  f[18] = type;
++  f[19] = 0;
++}
++
++static void
++check_header (const CrfpMocFpInfo *info)
++{
++  g_assert_cmphex (info->vendor_id, ==, 0x20534745);
++  g_assert_cmphex (info->product_id, ==, 0x171);
++  g_assert_cmphex (info->model_id, ==, 0x660);
++  g_assert_cmpuint (info->version, ==, 1);
++  g_assert_cmphex (info->errors, ==, 3);
++  g_assert_cmpuint (info->template_size, ==, 5156);
++  g_assert_cmpuint (info->template_max, ==, 5);
++  g_assert_cmpuint (info->template_valid, ==, 2);
++  g_assert_cmphex (info->template_dirty, ==, 2);
++  g_assert_cmpuint (info->template_version, ==, 4);
++}
++
++static void
++test_pick_version (void)
++{
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x8), ==, 3); /* srebrna */
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x3), ==, 1); /* bloonchipper */
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x2), ==, 1);
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x6), ==, 2);
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0xe), ==, 3);
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x1), ==, -1); /* v0 only */
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x0), ==, -1);
++  g_assert_cmpint (crfpmoc_fp_info_pick_version (0x10), ==, -1);
++}
++
++static void
++test_response_size (void)
++{
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (1), ==, 48);
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (2), ==, 36 + 10 * 16);
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (3), ==, 36 + 10 * 20);
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (0), ==, 0);
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (4), ==, 0);
++  /* Must fit the driver's CRFPMOC_EC_PROTO2_MAX_PARAM_SIZE (0xfc) clamp */
++  g_assert_cmpuint (crfpmoc_fp_info_response_size (3), <=, 0xfc);
++}
++
++static void
++test_v1 (void)
++{
++  g_autoptr(GError) error = NULL;
++  /* FP_INFO v1 response from the recorded FPC sensor in tests/crfpmoc */
++  static const guint8 v1[48] = {
++    0x46, 0x50, 0x43, 0x20, 0x09, 0x00, 0x00, 0x00, 0x1F, 0x02, 0x00, 0x00,
++    0x01, 0x00, 0x00, 0x00, 0x94, 0x66, 0x00, 0x00, 0x47, 0x52, 0x45, 0x59,
++    0xA0, 0x00, 0xA0, 0x00, 0x08, 0x00, 0xFF, 0x03, 0x24, 0x14, 0x00, 0x00,
++    0x05, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
++  };
++  CrfpMocFpInfo info;
++
++  g_assert_true (crfpmoc_fp_info_parse (1, v1, sizeof (v1), &info, &error));
++  g_assert_no_error (error);
++  g_assert_cmphex (info.vendor_id, ==, 0x20435046); /* "FPC " */
++  g_assert_cmphex (info.model_id, ==, 0x21f);
++  g_assert_true (info.has_frame);
++  g_assert_cmpuint (info.frame_size, ==, 0x6694);
++  g_assert_cmpuint (info.width, ==, 160);
++  g_assert_cmpuint (info.height, ==, 160);
++  g_assert_cmpuint (info.bpp, ==, 8);
++  g_assert_cmphex (info.errors, ==, 0x3ff);
++  g_assert_cmpuint (info.template_size, ==, 5156);
++  g_assert_cmpuint (info.template_max, ==, 5);
++  g_assert_cmpuint (info.template_valid, ==, 1);
++  g_assert_cmpuint (info.template_version, ==, 4);
++  g_assert_cmpuint (info.num_capture_types, ==, 1);
++
++  g_assert_false (crfpmoc_fp_info_parse (1, v1, sizeof (v1) - 1, &info, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++}
++
++static void
++test_v3 (void)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 b[36 + 10 * 20] = { 0 };
++  CrfpMocFpInfo info;
++
++  fill_header (b, 2);
++  /* First entry is a test pattern, second the vendor format: prefer it */
++  fill_v3_frame (b + 36, 1000, 64, 80, 4);
++  fill_v3_frame (b + 56, 27000, 180, 150, CRFPMOC_FP_CAPTURE_VENDOR_FORMAT);
++
++  g_assert_true (crfpmoc_fp_info_parse (3, b, sizeof (b), &info, &error));
++  g_assert_no_error (error);
++  check_header (&info);
++  g_assert_cmpuint (info.num_capture_types, ==, 2);
++  g_assert_true (info.has_frame);
++  g_assert_cmpuint (info.capture_type, ==, CRFPMOC_FP_CAPTURE_VENDOR_FORMAT);
++  g_assert_cmpuint (info.frame_size, ==, 27000);
++  g_assert_cmphex (info.pixel_format, ==, 0x59455247);
++  g_assert_cmpuint (info.width, ==, 180);
++  g_assert_cmpuint (info.height, ==, 150);
++  g_assert_cmpuint (info.bpp, ==, 8);
++}
++
++static void
++test_v3_no_vendor_format (void)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 b[36 + 10 * 20] = { 0 };
++  CrfpMocFpInfo info;
++
++  fill_header (b, 2);
++  fill_v3_frame (b + 36, 1000, 64, 80, 4);
++  fill_v3_frame (b + 56, 2000, 32, 32, 8);
++
++  g_assert_true (crfpmoc_fp_info_parse (3, b, sizeof (b), &info, &error));
++  g_assert_true (info.has_frame);
++  g_assert_cmpuint (info.capture_type, ==, 4);
++  g_assert_cmpuint (info.frame_size, ==, 1000);
++}
++
++static void
++test_v3_header_only (void)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 b[36 + 10 * 20] = { 0 };
++  CrfpMocFpInfo info;
++
++  /* num_capture_types claims more entries than were received */
++  fill_header (b, 10);
++  fill_v3_frame (b + 36, 27000, 180, 150, CRFPMOC_FP_CAPTURE_VENDOR_FORMAT);
++
++  g_assert_true (crfpmoc_fp_info_parse (3, b, 36, &info, &error));
++  g_assert_no_error (error);
++  check_header (&info);
++  g_assert_false (info.has_frame);
++
++  /* One full entry plus a partial one */
++  g_assert_true (crfpmoc_fp_info_parse (3, b, 36 + 20 + 7, &info, &error));
++  g_assert_true (info.has_frame);
++  g_assert_cmpuint (info.width, ==, 180);
++
++  /* Absurd count is clamped to FP_MAX_CAPTURE_TYPES and the buffer */
++  fill_header (b, 0xffff);
++  g_assert_true (crfpmoc_fp_info_parse (3, b, sizeof (b), &info, &error));
++  g_assert_cmpuint (info.num_capture_types, ==, 0xffff);
++
++  g_assert_false (crfpmoc_fp_info_parse (3, b, 35, &info, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++}
++
++static void
++test_v2 (void)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 b[36 + 10 * 16] = { 0 };
++  guint8 *f = b + 36;
++  CrfpMocFpInfo info;
++
++  fill_header (b, 1);
++  put32 (f + 0, 25600);
++  put32 (f + 4, 0x59455247);
++  put16 (f + 8, 160);
++  put16 (f + 10, 160);
++  put16 (f + 12, 8);
++  f[14] = CRFPMOC_FP_CAPTURE_VENDOR_FORMAT;
++
++  g_assert_true (crfpmoc_fp_info_parse (2, b, sizeof (b), &info, &error));
++  g_assert_no_error (error);
++  check_header (&info);
++  g_assert_true (info.has_frame);
++  g_assert_cmpuint (info.frame_size, ==, 25600);
++  g_assert_cmpuint (info.width, ==, 160);
++  g_assert_cmpuint (info.height, ==, 160);
++  g_assert_cmpuint (info.bpp, ==, 8);
++}
++
++static void
++test_bad_version (void)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 b[64] = { 0 };
++  CrfpMocFpInfo info;
++
++  g_assert_false (crfpmoc_fp_info_parse (0, b, sizeof (b), &info, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
++  g_clear_error (&error);
++  g_assert_false (crfpmoc_fp_info_parse (3, NULL, 0, &info, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++  g_test_add_func ("/crfpmoc/fp-info/pick-version", test_pick_version);
++  g_test_add_func ("/crfpmoc/fp-info/response-size", test_response_size);
++  g_test_add_func ("/crfpmoc/fp-info/v1", test_v1);
++  g_test_add_func ("/crfpmoc/fp-info/v2", test_v2);
++  g_test_add_func ("/crfpmoc/fp-info/v3", test_v3);
++  g_test_add_func ("/crfpmoc/fp-info/v3-no-vendor-format", test_v3_no_vendor_format);
++  g_test_add_func ("/crfpmoc/fp-info/v3-header-only", test_v3_header_only);
++  g_test_add_func ("/crfpmoc/fp-info/bad-version", test_bad_version);
++
++  return g_test_run ();
++}

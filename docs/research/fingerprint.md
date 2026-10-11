@@ -69,6 +69,7 @@ The two main pieces already exist. Each needs a little adaptation:
     - Commands: `FP_INFO/MODE/STATS/ENC_STATUS/SEED/CONTEXT/FRAME/TEMPLATE`.
     - Stores the encrypted template blob as the fprintd print data and re-uploads it.
   - **Caveat [V code]:** `crfpmoc_init_keys()` generates a **random seed and user context on every open**. FP_SEED is write-once per FPMCU boot, so templates enrolled in one FPMCU boot shouldn't decrypt after a full power cycle. **[I — test]** For a laptop you reboot, plan to patch it to use a stable, TPM-sealed seed and user ID.
+    - Update (10 Oct 2026, hardware): the context is random per open too, so prints would not even survive an fprintd restart. srebrna answers `FP_INFO` only in v3; MR !512 asks for v1 and gets `INVALID_VERSION`. Both are patched in `assets/packages/libfprint-crfpmoc` (seed: root-only file, not TPM-sealed yet). See the Fingerprint section of `docs/cachyos-ruby.md`. **[V code and fpinfo on hardware / I fprintd-restart effect]**
   - Issue #568 (HP x360 14c Chromebook fingerprint) is a user report only.
 - **Community projects**
   - chrultrabook forum thread, Apr 2024–Sep 2026, covers ectool usage, `fpseed`, Fedora/NixOS/KDE successes and SELinux issues: https://forum.chrultrabook.com/t/in-search-of-contributors-to-a-linux-chromebook-fingerprint-pam-module/1819

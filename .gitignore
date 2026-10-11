@@ -26,3 +26,7 @@ __pycache__/
 .DS_Store
 recon-*/
 recon-*.tar.gz
+# makepkg working directories of assets/packages/*
+/assets/packages/*/src/
+/assets/packages/*/pkg/
+/assets/packages/libfprint-crfpmoc/libfprint/

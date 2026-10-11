@@ -1,0 +1,772 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Nick Barrios <25010449+nbarrios@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 22:02:03 -0700
+Subject: [PATCH 3/3] crfpmoc: Use a persistent seed and a stable user id
+
+FP_SEED is write-once per FPMCU boot and, together with the FP_CONTEXT
+user id, keys the encryption of every template. Upstream picks both at
+random on every open, so stored prints stop matching after fprintd
+restarts or a reboot.
+
+Read the 32-byte seed from /var/lib/fprint/crfpmoc-seed (created once with
+getrandom(2), directory 0700, file 0600) and refuse it if it is not a
+regular root-owned file with no permission bits outside 0600, or if its
+directory is not root-owned or is group/world writable. Derive the user id
+as SHA-256("crfpmoc-userid-v1" || seed).
+
+Only set the seed if FP_ENC_STATUS does not report FP_ENC_STATUS_SEED_SET,
+and treat EC_RES_ACCESS_DENIED from FP_SEED as 'already set' instead of a
+failure. Emulation mode keeps the fixed test seed and context.
+
+Trade-off: the seed is stored in plaintext rather than sealed to the TPM;
+see crfpmoc-seed.h.
+---
+ libfprint/drivers/crfpmoc/crfpmoc-seed.c | 265 +++++++++++++++++++++++
+ libfprint/drivers/crfpmoc/crfpmoc-seed.h |  66 ++++++
+ libfprint/drivers/crfpmoc/crfpmoc.c      |  73 ++++++-
+ libfprint/drivers/crfpmoc/crfpmoc.h      |   3 +-
+ libfprint/meson.build                    |   1 +
+ tests/crfpmoc-v3/custom.ioctl            |   3 +-
+ tests/meson.build                        |   1 +
+ tests/test-crfpmoc-seed.c                | 205 ++++++++++++++++++
+ 8 files changed, 603 insertions(+), 14 deletions(-)
+ create mode 100644 libfprint/drivers/crfpmoc/crfpmoc-seed.c
+ create mode 100644 libfprint/drivers/crfpmoc/crfpmoc-seed.h
+ create mode 100644 tests/test-crfpmoc-seed.c
+
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-seed.c b/libfprint/drivers/crfpmoc/crfpmoc-seed.c
+new file mode 100644
+index 00000000..073bae71
+--- /dev/null
++++ b/libfprint/drivers/crfpmoc/crfpmoc-seed.c
+@@ -0,0 +1,265 @@
++/*
++ * ChromeOS Fingerprint driver for libfprint - persistent FP_SEED
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/random.h>
++#include <sys/stat.h>
++#include <gio/gio.h>
++
++#include "crfpmoc-seed.h"
++
++#define USERID_LABEL "crfpmoc-userid-v1"
++
++static gboolean
++set_errno_error (GError **error, int errsv, const char *what, const char *path)
++{
++  g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errsv),
++               "%s %s: %s", what, path, g_strerror (errsv));
++  return FALSE;
++}
++
++/* Open (creating if needed) the seed directory and check it cannot be
++ * modified by anyone but @owner. */
++static int
++open_seed_dir (const char *dir, uid_t owner, GError **error)
++{
++  struct stat st;
++  int dfd;
++
++  if (mkdir (dir, 0700) < 0 && errno != EEXIST)
++    {
++      set_errno_error (error, errno, "Cannot create", dir);
++      return -1;
++    }
++
++  dfd = open (dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++  if (dfd < 0)
++    {
++      set_errno_error (error, errno, "Cannot open", dir);
++      return -1;
++    }
++
++  if (fstat (dfd, &st) < 0)
++    {
++      set_errno_error (error, errno, "Cannot stat", dir);
++      close (dfd);
++      return -1;
++    }
++
++  if (st.st_uid != owner || (st.st_mode & (S_IWGRP | S_IWOTH)))
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++                   "Refusing seed directory %s: owner %u mode %04o "
++                   "(must be owned by uid %u and not group/world writable)",
++                   dir, (unsigned) st.st_uid, (unsigned) (st.st_mode & 07777),
++                   (unsigned) owner);
++      close (dfd);
++      return -1;
++    }
++
++  return dfd;
++}
++
++static gboolean
++fill_random (guint8 *buf, gsize len, GError **error)
++{
++  gsize done = 0;
++
++  while (done < len)
++    {
++      ssize_t r = getrandom (buf + done, len - done, 0);
++
++      if (r < 0)
++        {
++          if (errno == EINTR)
++            continue;
++          return set_errno_error (error, errno, "getrandom failed for", "seed");
++        }
++      done += r;
++    }
++
++  return TRUE;
++}
++
++static gboolean
++write_all (int fd, const guint8 *buf, gsize len)
++{
++  while (len > 0)
++    {
++      ssize_t r = write (fd, buf, len);
++
++      if (r < 0)
++        {
++          if (errno == EINTR)
++            continue;
++          return FALSE;
++        }
++      buf += r;
++      len -= r;
++    }
++  return TRUE;
++}
++
++/* Create @base in @dfd atomically with fresh random content. Losing a race
++ * against another creator is fine: the caller then reads the winner's file. */
++static gboolean
++create_seed_file (int dfd, const char *path, const char *base, GError **error)
++{
++  g_autofree char *tmp = g_strdup_printf (".%s.tmp.%d", base, (int) getpid ());
++  guint8 seed[CRFPMOC_SEED_BYTES];
++  gboolean ok = FALSE;
++  int fd;
++
++  unlinkat (dfd, tmp, 0);
++  fd = openat (dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++  if (fd < 0)
++    return set_errno_error (error, errno, "Cannot create temporary seed file for", path);
++
++  if (!fill_random (seed, sizeof (seed), error))
++    goto out;
++
++  if (fchmod (fd, 0600) < 0 || !write_all (fd, seed, sizeof (seed)) || fsync (fd) < 0)
++    {
++      set_errno_error (error, errno, "Cannot write", path);
++      goto out;
++    }
++
++  /* link() never replaces an existing file */
++  if (linkat (dfd, tmp, dfd, base, 0) < 0 && errno != EEXIST)
++    {
++      set_errno_error (error, errno, "Cannot create", path);
++      goto out;
++    }
++
++  fsync (dfd);
++  g_message ("crfpmoc: created new fingerprint seed %s", path);
++  ok = TRUE;
++
++out:
++  explicit_bzero (seed, sizeof (seed));
++  close (fd);
++  unlinkat (dfd, tmp, 0);
++  return ok;
++}
++
++gboolean
++crfpmoc_seed_load_or_create (const char *path,
++                             uid_t       owner,
++                             guint8      seed[CRFPMOC_SEED_BYTES],
++                             GError    **error)
++{
++  g_autofree char *dir = NULL;
++  g_autofree char *base = NULL;
++  struct stat st;
++  gsize done = 0;
++  gboolean ok = FALSE;
++  int dfd;
++  int fd;
++
++  g_return_val_if_fail (path != NULL && g_path_is_absolute (path), FALSE);
++
++  dir = g_path_get_dirname (path);
++  base = g_path_get_basename (path);
++
++  dfd = open_seed_dir (dir, owner, error);
++  if (dfd < 0)
++    return FALSE;
++
++  fd = openat (dfd, base, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC);
++  if (fd < 0 && errno == ENOENT)
++    {
++      if (!create_seed_file (dfd, path, base, error))
++        goto out_dir;
++      fd = openat (dfd, base, O_RDONLY | O_NOFOLLOW | O_NOCTTY | O_CLOEXEC);
++    }
++  if (fd < 0)
++    {
++      set_errno_error (error, errno, "Cannot open", path);
++      goto out_dir;
++    }
++
++  if (fstat (fd, &st) < 0)
++    {
++      set_errno_error (error, errno, "Cannot stat", path);
++      goto out;
++    }
++
++  if (!S_ISREG (st.st_mode) || st.st_uid != owner ||
++      (st.st_mode & 07777 & ~(mode_t) 0600))
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
++                   "Refusing seed file %s: owner %u mode %04o "
++                   "(must be a regular file owned by uid %u, mode 0600 or stricter)",
++                   path, (unsigned) st.st_uid, (unsigned) (st.st_mode & 07777),
++                   (unsigned) owner);
++      goto out;
++    }
++
++  if (st.st_size != CRFPMOC_SEED_BYTES)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                   "Seed file %s has %" G_GINT64_FORMAT " bytes, expected %d",
++                   path, (gint64) st.st_size, CRFPMOC_SEED_BYTES);
++      goto out;
++    }
++
++  while (done < CRFPMOC_SEED_BYTES)
++    {
++      ssize_t r = read (fd, seed + done, CRFPMOC_SEED_BYTES - done);
++
++      if (r < 0 && errno == EINTR)
++        continue;
++      if (r <= 0)
++        {
++          if (r == 0)
++            g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                         "Short read from %s", path);
++          else
++            set_errno_error (error, errno, "Cannot read", path);
++          explicit_bzero (seed, CRFPMOC_SEED_BYTES);
++          goto out;
++        }
++      done += r;
++    }
++
++  ok = TRUE;
++
++out:
++  close (fd);
++out_dir:
++  close (dfd);
++  return ok;
++}
++
++void
++crfpmoc_derive_user_id (const guint8 seed[CRFPMOC_SEED_BYTES],
++                        guint8       user_id[CRFPMOC_USERID_BYTES])
++{
++  g_autoptr(GChecksum) sum = g_checksum_new (G_CHECKSUM_SHA256);
++  gsize len = CRFPMOC_USERID_BYTES;
++
++  G_STATIC_ASSERT (CRFPMOC_USERID_BYTES == 32); /* SHA-256 digest size */
++
++  g_checksum_update (sum, (const guchar *) USERID_LABEL, strlen (USERID_LABEL));
++  g_checksum_update (sum, seed, CRFPMOC_SEED_BYTES);
++  g_checksum_get_digest (sum, user_id, &len);
++  g_assert (len == CRFPMOC_USERID_BYTES);
++}
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc-seed.h b/libfprint/drivers/crfpmoc/crfpmoc-seed.h
+new file mode 100644
+index 00000000..4faa563f
+--- /dev/null
++++ b/libfprint/drivers/crfpmoc/crfpmoc-seed.h
+@@ -0,0 +1,66 @@
++/*
++ * ChromeOS Fingerprint driver for libfprint - persistent FP_SEED
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/* The FPMCU encrypts every template it hands to the host with a key derived
++ * from an MCU-internal secret, the FP_SEED (32 bytes, write-once per FPMCU
++ * boot) and the FP_CONTEXT user id. ChromeOS derives the seed from the TPM.
++ * Upstream crfpmoc picks a random seed and user id on every open, so stored
++ * prints stop matching after fprintd restarts or the machine reboots.
++ *
++ * Here the seed lives in a root-only file created once with getrandom(2),
++ * and the user id is derived from it, so prints survive reboots.
++ *
++ * Security trade-off: the seed is stored in plaintext (0600 root) instead of
++ * being sealed to the TPM. Templates stay useless without this particular
++ * FPMCU (its internal key never leaves the chip), but anyone who can read
++ * the seed and the stored prints (root, or offline access to an unencrypted
++ * disk) can load them back into this FPMCU. Root can already fake matches on
++ * a match-on-chip reader without authenticated sessions, so this matches the
++ * existing trust model; TPM sealing would only add protection against
++ * offline disk access.
++ */
++
++#pragma once
++
++#include <glib.h>
++#include <sys/types.h>
++
++G_BEGIN_DECLS
++
++#define CRFPMOC_SEED_FILE "/var/lib/fprint/crfpmoc-seed"
++#define CRFPMOC_SEED_BYTES 32   /* FP_CONTEXT_TPM_BYTES */
++#define CRFPMOC_USERID_BYTES 32 /* FP_CONTEXT_USERID_BYTES */
++
++/* Read the seed from @path, creating it (and a missing parent directory,
++ * mode 0700) with getrandom(2) if it does not exist. Refuses a file that is
++ * not a regular file of exactly CRFPMOC_SEED_BYTES bytes owned by @owner
++ * with no permission bits outside 0600, or whose directory is not owned by
++ * @owner or is group/world writable. The driver passes owner 0 (root);
++ * tests pass their own uid. Errors are in the G_IO_ERROR domain. */
++gboolean crfpmoc_seed_load_or_create (const char *path,
++                                      uid_t       owner,
++                                      guint8      seed[CRFPMOC_SEED_BYTES],
++                                      GError    **error);
++
++/* Stable FP_CONTEXT user id: SHA-256 ("crfpmoc-userid-v1" || seed). One user
++ * id per machine: the FPMCU holds a single context, and identify galleries
++ * may mix users. */
++void crfpmoc_derive_user_id (const guint8 seed[CRFPMOC_SEED_BYTES],
++                             guint8       user_id[CRFPMOC_USERID_BYTES]);
++
++G_END_DECLS
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.c b/libfprint/drivers/crfpmoc/crfpmoc.c
+index b4475868..6c637085 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc.c
+@@ -29,6 +29,7 @@
+ #include "crfpmoc.h"
+ #include "crfpmoc-ec-transfer.h"
+ #include "crfpmoc-fp-info.h"
++#include "crfpmoc-seed.h"
+ 
+ struct _FpiDeviceCrfpMoc
+ {
+@@ -1138,12 +1139,18 @@ crfpmoc_open_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
+   fpi_device_open_complete (device, error);
+ }
+ 
+-/* Initialise the per-session encryption seed and user context. In emulation
+- * mode fixed test values are used so the recorded ioctl replay stays
+- * deterministic; on real hardware random values are generated.
++/* Initialise the encryption seed and user context. In emulation mode fixed
++ * test values are used so the recorded ioctl replay stays deterministic.
++ *
++ * On real hardware the seed comes from a root-only file that is created once
++ * with getrandom(2), and the FP_CONTEXT user id is derived from it, so the
++ * FPMCU derives the same template key after fprintd restarts, FPMCU reboots
++ * and host reboots. (Upstream generated both randomly on every open, which
++ * made stored prints unusable after a reboot.) See crfpmoc-seed.h for the
++ * security trade-off of a plaintext seed file versus TPM sealing.
+  */
+-static void
+-crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
++static gboolean
++crfpmoc_init_keys (FpiDeviceCrfpMoc *self, GError **error)
+ {
+   G_STATIC_ASSERT (sizeof (self->seed) == CRFPMOC_FP_CONTEXT_TPM_BYTES);
+   G_STATIC_ASSERT (sizeof (self->context) == CRFPMOC_FP_CONTEXT_USERID_BYTES);
+@@ -1157,12 +1164,30 @@ crfpmoc_init_keys (FpiDeviceCrfpMoc *self)
+     }
+   else
+     {
+-      for (size_t i = 0; i < sizeof (self->seed); i++)
+-        self->seed[i] = (guint8) g_random_int_range (0, 256);
++      g_autoptr(GError) local_error = NULL;
++
++      G_STATIC_ASSERT (sizeof (self->seed) == CRFPMOC_SEED_BYTES);
++      G_STATIC_ASSERT (sizeof (self->context) == CRFPMOC_USERID_BYTES);
++
++      if (!crfpmoc_seed_load_or_create (CRFPMOC_SEED_FILE, 0, self->seed, &local_error))
++        {
++          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL,
++                       "Cannot load the fingerprint seed: %s", local_error->message);
++          return FALSE;
++        }
+ 
+-      for (size_t i = 0; i < sizeof (self->context); i++)
+-        self->context[i] = (guint8) g_random_int_range (0, 256);
++      crfpmoc_derive_user_id (self->seed, self->context);
++      fp_dbg ("Loaded persistent seed from %s", CRFPMOC_SEED_FILE);
+     }
++
++  return TRUE;
++}
++
++static void
++crfpmoc_clear_keys (FpiDeviceCrfpMoc *self)
++{
++  explicit_bzero (self->seed, sizeof (self->seed));
++  explicit_bzero (self->context, sizeof (self->context));
+ }
+ 
+ static void
+@@ -1193,7 +1218,12 @@ crfpmoc_open (FpDevice *device)
+       fp_dbg ("Created temporary ioctl file for recording: %s", ioctl_file);
+     }
+ 
+-  crfpmoc_init_keys (self);
++  if (!crfpmoc_init_keys (self, &error))
++    {
++      g_clear_fd (&self->emul_fd, NULL);
++      fpi_device_open_complete (device, g_steal_pointer (&error));
++      return;
++    }
+ 
+   g_assert (self->task_ssm == NULL);
+   self->task_ssm = fpi_ssm_new (device, crfpmoc_open_run_state, OPEN_STATES);
+@@ -1250,6 +1280,7 @@ crfpmoc_close (FpDevice *device)
+   fp_dbg ("Closing device");
+ 
+   crfpmoc_reset_sync (device);
++  crfpmoc_clear_keys (self);
+   g_clear_fd (&self->emul_fd, &error);
+ 
+   fpi_device_close_complete (device, g_steal_pointer (&error));
+@@ -1987,9 +2018,12 @@ crfpmoc_keys_enc_status_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpoi
+     }
+ 
+   resp = (struct crfpmoc_ec_response_fp_encryption_status *) transfer->indata;
+-  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: %d", resp->status);
++  fp_dbg ("crfpmoc_keys_enc_status_cb: FPMCU encryption status: 0x%x (valid 0x%x)",
++          resp->status, resp->valid_flags);
+ 
+-  if (resp->status == 0)
++  /* FP_SEED is accepted once per FPMCU boot. If it is already set we assume
++   * it is our persistent seed, set by an earlier open in this FPMCU boot. */
++  if (!(resp->status & CRFPMOC_FP_ENC_STATUS_SEED_SET))
+     fpi_ssm_next_state (ssm); /* KEYS_SET_SEED */
+   else
+     fpi_ssm_jump_to_state (ssm, KEYS_CTX_ASYNC);
+@@ -2003,6 +2037,21 @@ crfpmoc_keys_seed_cb (CrfpMocEcTransfer *transfer, GAsyncResult *res, gpointer u
+ 
+   if (!crfpmoc_ec_transfer_submit_finish (res, &error))
+     {
++      /* Seed got set between the status query and now (or the status bit
++       * is not reported). Carry on: if it was set by us, all is well; if
++       * another OS set a different seed before a warm reboot, prints will
++       * not match until the FPMCU is rebooted. */
++      if (transfer->ec_result == EC_RES_ACCESS_DENIED)
++        {
++          /* Not fp_warn: expected after a warm reboot, and tests run with
++           * fatal warnings. g_message is shown in the journal by default. */
++          g_message ("crfpmoc: FP_SEED already set in this FPMCU boot; continuing. If "
++                   "prints do not match, reboot the FPMCU (ectool --name=cros_fp "
++                   "reboot_ec) so the persistent seed can be set.");
++          fpi_ssm_next_state (ssm); /* KEYS_CTX_ASYNC */
++          return;
++        }
++
+       fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+       return;
+     }
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.h b/libfprint/drivers/crfpmoc/crfpmoc.h
+index b845e025..b65abdfc 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.h
++++ b/libfprint/drivers/crfpmoc/crfpmoc.h
+@@ -91,7 +91,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceCrfpMoc, fpi_device_crfpmoc, FPI, DEVICE_CRFPMOC,
+ /* Fixed seed and context used only in emulation mode so that the recorded
+  * ioctl replay is deterministic. They are exactly 32 bytes long (the seed and
+  * context buffer size) and differ from each other so they are distinguishable
+- * in the recorded ioctls. Real hardware uses secure random values instead.
++ * in the recorded ioctls. Real hardware uses the persistent seed file and a
++ * user id derived from it instead (see crfpmoc-seed.h).
+  */
+ #define CRFPMOC_DEFAULT_SEED "seedseedseedseedseedseedseedseed"
+ #define CRFPMOC_DEFAULT_CONTEXT "ctxctxctxctxctxctxctxctxctxctxct"
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index b40e7524..581ec99b 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -106,6 +106,7 @@ driver_sources = {
+         'drivers/crfpmoc/crfpmoc.c',
+         'drivers/crfpmoc/crfpmoc-ec-transfer.c',
+         'drivers/crfpmoc/crfpmoc-fp-info.c',
++        'drivers/crfpmoc/crfpmoc-seed.c',
+     ),
+     'vcom5s' : files('drivers/vcom5s.c'),
+     'vfs101' : files('drivers/vfs101.c'),
+diff --git a/tests/crfpmoc-v3/custom.ioctl b/tests/crfpmoc-v3/custom.ioctl
+index e07c91a1..5682269e 100644
+--- a/tests/crfpmoc-v3/custom.ioctl
++++ b/tests/crfpmoc-v3/custom.ioctl
+@@ -8,7 +8,8 @@ CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
+ CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000080000000
+ CROS_EC_DEV_IOCXCMD_V2 4 000000000204000004000000040000000000000000000000
+ CROS_EC_DEV_IOCXCMD_V2 236 030000000304000000000000EC0000000000000046504320090000001F020000010000000100FF0324140000050000000100000004000000946600000000000047524559A000A00008000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+-CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000001000000
++CROS_EC_DEV_IOCXCMD_V2 8 00000000090400000000000008000000000000000100000000000000
++CROS_EC_DEV_IOCXCMD_V2 0 0000000008040000240000000000000004000000
+ CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
+ CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000010000000
+ CROS_EC_DEV_IOCXCMD_V2 0 0100000006040000240000000000000000000000
+diff --git a/tests/meson.build b/tests/meson.build
+index 16928edb..fbfb690a 100644
+--- a/tests/meson.build
++++ b/tests/meson.build
+@@ -383,6 +383,7 @@ endforeach
+ if 'crfpmoc' in drivers
+     crfpmoc_unit_tests = {
+         'crfpmoc-fp-info': files('../libfprint/drivers/crfpmoc/crfpmoc-fp-info.c'),
++        'crfpmoc-seed': files('../libfprint/drivers/crfpmoc/crfpmoc-seed.c'),
+     }
+     foreach test_name, test_sources: crfpmoc_unit_tests
+         test_exe = executable('test-' + test_name,
+diff --git a/tests/test-crfpmoc-seed.c b/tests/test-crfpmoc-seed.c
+new file mode 100644
+index 00000000..8f2bd336
+--- /dev/null
++++ b/tests/test-crfpmoc-seed.c
+@@ -0,0 +1,205 @@
++/*
++ * Unit tests for the crfpmoc persistent seed file
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <glib/gstdio.h>
++#include <gio/gio.h>
++
++#include "crfpmoc-seed.h"
++
++typedef struct
++{
++  char *tmpdir;
++  char *dir;
++  char *path;
++} Fixture;
++
++static void
++fixture_setup (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++
++  f->tmpdir = g_dir_make_tmp ("crfpmoc-seed-XXXXXX", &error);
++  g_assert_no_error (error);
++  /* Not created yet: the loader must create it 0700 */
++  f->dir = g_build_filename (f->tmpdir, "fprint", NULL);
++  f->path = g_build_filename (f->dir, "crfpmoc-seed", NULL);
++}
++
++static void
++fixture_teardown (Fixture *f, gconstpointer data)
++{
++  g_autofree char *link = g_build_filename (f->dir, "link", NULL);
++
++  g_chmod (f->dir, 0700);
++  g_unlink (link);
++  g_unlink (f->path);
++  g_rmdir (f->dir);
++  g_rmdir (f->tmpdir);
++  g_free (f->path);
++  g_free (f->dir);
++  g_free (f->tmpdir);
++}
++
++static void
++test_create_and_reload (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 seed1[CRFPMOC_SEED_BYTES], seed2[CRFPMOC_SEED_BYTES];
++  guint8 zero[CRFPMOC_SEED_BYTES] = { 0 };
++  g_autofree char *contents = NULL;
++  gsize len;
++  GStatBuf st;
++
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed1, &error));
++  g_assert_no_error (error);
++  g_assert_true (memcmp (seed1, zero, sizeof (zero)) != 0);
++
++  g_assert_cmpint (g_stat (f->dir, &st), ==, 0);
++  g_assert_cmphex (st.st_mode & 07777, ==, 0700);
++  g_assert_cmpint (g_stat (f->path, &st), ==, 0);
++  g_assert_cmphex (st.st_mode & 07777, ==, 0600);
++  g_assert_cmpint (st.st_size, ==, CRFPMOC_SEED_BYTES);
++
++  g_assert_true (g_file_get_contents (f->path, &contents, &len, NULL));
++  g_assert_cmpmem (contents, len, seed1, sizeof (seed1));
++
++  /* Stable across loads */
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed2, &error));
++  g_assert_no_error (error);
++  g_assert_cmpmem (seed1, sizeof (seed1), seed2, sizeof (seed2));
++
++  /* Stricter permissions are fine */
++  g_assert_cmpint (g_chmod (f->path, 0400), ==, 0);
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed2, &error));
++  g_assert_no_error (error);
++}
++
++static void
++test_wide_permissions (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 seed[CRFPMOC_SEED_BYTES];
++  const int bad_modes[] = { 0640, 0604, 0644, 0700, 0610, 04600 };
++
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++
++  for (guint i = 0; i < G_N_ELEMENTS (bad_modes); i++)
++    {
++      g_assert_cmpint (g_chmod (f->path, bad_modes[i]), ==, 0);
++      g_assert_false (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++      g_assert_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
++      g_clear_error (&error);
++    }
++}
++
++static void
++test_wrong_owner (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 seed[CRFPMOC_SEED_BYTES];
++
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++  /* Directory and file belong to us, not to the expected owner */
++  g_assert_false (crfpmoc_seed_load_or_create (f->path, getuid () + 1, seed, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
++}
++
++static void
++test_writable_dir (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 seed[CRFPMOC_SEED_BYTES];
++
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++  g_assert_cmpint (g_chmod (f->dir, 0770), ==, 0);
++  g_assert_false (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED);
++}
++
++static void
++test_wrong_size (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  guint8 seed[CRFPMOC_SEED_BYTES];
++
++  g_assert_cmpint (g_mkdir (f->dir, 0700), ==, 0);
++  g_assert_true (g_file_set_contents_full (f->path, "short", 5,
++                                           G_FILE_SET_CONTENTS_NONE, 0600, NULL));
++  g_assert_false (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
++}
++
++static void
++test_symlink (Fixture *f, gconstpointer data)
++{
++  g_autoptr(GError) error = NULL;
++  g_autofree char *link = g_build_filename (f->dir, "link", NULL);
++  guint8 seed[CRFPMOC_SEED_BYTES];
++
++  g_assert_true (crfpmoc_seed_load_or_create (f->path, getuid (), seed, &error));
++  g_assert_cmpint (symlink (f->path, link), ==, 0);
++  g_assert_false (crfpmoc_seed_load_or_create (link, getuid (), seed, &error));
++  g_assert_nonnull (error);
++}
++
++static void
++test_user_id (void)
++{
++  guint8 seed[CRFPMOC_SEED_BYTES];
++  guint8 id1[CRFPMOC_USERID_BYTES], id2[CRFPMOC_USERID_BYTES];
++  /* sha256 ("crfpmoc-userid-v1" || 00 01 .. 1f) */
++  static const guint8 expected[CRFPMOC_USERID_BYTES] = {
++    0x86, 0xd3, 0xda, 0xaa, 0x41, 0x8d, 0x43, 0x3e, 0x96, 0xda, 0x6b, 0x96,
++    0xbb, 0x8f, 0xe7, 0xde, 0x79, 0x51, 0x73, 0x00, 0xdc, 0xab, 0xdc, 0x6e,
++    0xa3, 0x0c, 0x88, 0xf9, 0x0b, 0xdc, 0x1d, 0x9f,
++  };
++
++  for (guint i = 0; i < sizeof (seed); i++)
++    seed[i] = i;
++
++  crfpmoc_derive_user_id (seed, id1);
++  g_assert_cmpmem (id1, sizeof (id1), expected, sizeof (expected));
++  crfpmoc_derive_user_id (seed, id2);
++  g_assert_cmpmem (id1, sizeof (id1), id2, sizeof (id2));
++
++  seed[0] ^= 1;
++  crfpmoc_derive_user_id (seed, id2);
++  g_assert_true (memcmp (id1, id2, sizeof (id1)) != 0);
++}
++
++int
++main (int argc, char *argv[])
++{
++  g_test_init (&argc, &argv, NULL);
++
++#define ADD(name, func) \
++  g_test_add ("/crfpmoc/seed/" name, Fixture, NULL, fixture_setup, func, fixture_teardown)
++  ADD ("create-and-reload", test_create_and_reload);
++  ADD ("wide-permissions", test_wide_permissions);
++  ADD ("wrong-owner", test_wrong_owner);
++  ADD ("writable-dir", test_writable_dir);
++  ADD ("wrong-size", test_wrong_size);
++  ADD ("symlink", test_symlink);
++#undef ADD
++  g_test_add_func ("/crfpmoc/seed/user-id", test_user_id);
++
++  return g_test_run ();
++}

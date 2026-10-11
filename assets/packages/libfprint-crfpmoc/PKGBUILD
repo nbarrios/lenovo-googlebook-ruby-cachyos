@@ -1,0 +1,95 @@
+# libfprint with the ChromeOS fingerprint MCU driver (crfpmoc) for the
+# Lenovo Googlebook 15 (Ruby). Based on the Arch/CachyOS libfprint PKGBUILD
+# (1.94.100-1, maintainer Jan Alexander Steffens (heftig)); replaces libfprint
+# so fprintd keeps working. See docs/cachyos-ruby.md, Fingerprint.
+#
+# Patches:
+#  0001  libfprint MR !512 (crfpmoc) at 56442591a5c302a906289f30988fb50fc3d82ed6,
+#        unmodified diff against its base 91012c36; applies to v1.94.100.
+#  0002  FP_INFO v2/v3 (the srebrna FPMCU only answers v3), with unit tests
+#        and a v3 replay test.
+#  0003  Persistent FP_SEED in /var/lib/fprint/crfpmoc-seed (root, 0600) and a
+#        user id derived from it, so prints survive reboots.
+#
+# Rebuild when CachyOS updates libfprint: bump pkgver and the commit, check
+# that the patches still apply, run updpkgsums.
+
+pkgname=libfprint-crfpmoc
+_pkgname=libfprint
+pkgver=1.94.100
+pkgrel=1
+# Signed tag v1.94.100. The source checksum equals Arch's b2sum for the
+# signature-verified tag (56cbe62a...0e15466d08), so no PGP key is needed here.
+_commit=80a4b5ec612892c5c056c48dddaa561452cf37ec
+pkgdesc="Library for fingerprint readers, with the ChromeOS FPMCU (crfpmoc) driver"
+url="https://fprint.freedesktop.org/"
+arch=(x86_64)
+license=(LGPL-2.1-or-later)
+depends=(
+  libgcc
+  glib2
+  glibc
+  libgudev
+  libgusb
+  openssl
+  pixman
+)
+makedepends=(
+  git
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python-cairo
+  python-gobject
+  systemd
+)
+checkdepends=(
+  cairo
+  umockdev
+)
+provides=("libfprint=$pkgver" libfprint-2.so)
+conflicts=(libfprint)
+source=(
+  "git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=$_commit"
+  0001-crfpmoc-driver-from-MR-512-56442591.patch
+  0002-crfpmoc-Support-EC_CMD_FP_INFO-v2-v3.patch
+  0003-crfpmoc-Use-a-persistent-seed-and-a-stable-user-id.patch
+)
+sha256sums=('18fcee9ffb2adb9ba2ea229850e9266d0bcad2df5fad556beffce6c8ba84f192'
+            '6afd5e32fc7a7f70a1730286890d21ed05e76ce1c866a5ea19804d8321f1113b'
+            'c07686cca5756f561700c33696c35fff7d6b1d41ebba1eac5d3453f05f955988'
+            '4be3458b6a4d7c49b80521d7f938a39598f36a4f8ba53537d7208af7f025475e')
+
+prepare() {
+  cd $_pkgname
+  local p
+  for p in "${source[@]:1}"; do
+    echo "Applying $p"
+    git apply --whitespace=nowarn "$srcdir/$p"
+  done
+}
+
+build() {
+  local meson_options=(
+    # Add virtual drivers for integration tests (e.g. in fprintd)
+    -D drivers=all
+
+    -D installed-tests=false
+  )
+
+  arch-meson $_pkgname build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  # Serial: upstream's egis_etu905 replay test times out (5 s cancel) when
+  # run in parallel with the rest of the suite, also on unpatched 1.94.100.
+  meson test -C build --print-errorlogs --num-processes 1
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
+
+# vim:set sw=2 sts=-1 et:
