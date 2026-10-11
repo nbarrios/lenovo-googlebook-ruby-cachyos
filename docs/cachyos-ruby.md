@@ -11,7 +11,7 @@ Experimental port of the Lapis procedure to the Lenovo Googlebook 15 (DMI `Googl
 | Graphics | Same `0xb090` device. **One plain Xe load** hands the panel over cleanly; the Lapis unload/reload is not used |
 | Hyprland live desktop, keyboard, ELAN touchpad, Goodix touchscreen | Work |
 | Wi-Fi | Intel CNVi `8086:e440`, firmware loads |
-| Audio | RT5682S headset codec + 4x TI TAS2563 amplifiers on I2S, SOF topology `sof-ptl-tas2563-rt5682.tplg`. Speakers verified 10 October 2026; headphones/mics enumerate |
+| Audio | RT5682S headset codec + 4x TI TAS2563 amplifiers on I2S, SOF topology `sof-ptl-tas2563-rt5682.tplg`. Speakers, headphones (auto-switch) and internal mics verified 10 October 2026 |
 | CachyOS internal install | Completed and booted from internal disk, 10 October 2026 |
 
 ## Differences from the Lapis/Omarchy install
@@ -96,6 +96,12 @@ The script reads Lenovo's `tas2563RCA4.bin` and `tas2563_coef.bin` from the unto
 Factory per-speaker calibration lives in coreboot VPD (`dsm_calib_register_array`, `dsm_calib_value_0..3`), not on the erased disk. `ruby-speaker-calibration.service` writes it to the driver's write-only `Speaker Calibrated Data` control at boot.
 
 Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby module (`intel/sof-ipc4/ptl/ruby/sof-ptl.ri`, 2.14.1008.1) and a topology with `dolby-dax` pipelines. `ruby-dax.conf` points `snd_sof_pci` at them, as Googlebook OS's `mod_options --sof-fw` does, and a conditional UCM BootSequence block loads `dax_param.bin` and the factory switch/profile values. Remove `/etc/modprobe.d/ruby-dax.conf` to return to the stock sof-firmware files; the UCM block then skips itself. Toggle live with `amixer -c sofrt5682 cset name='DAX Speaker Switch' on|off`.
+
+Microphones: there is no NHLT table, so `ruby-audio.conf` sets `dmic_num=4`. The DMICs are rated -26 dBFS at 94 dB SPL and SOF capture gain tops out at 0 dB, so speech arrives near -60 dBFS. Googlebook OS added gain in software; `/etc/pipewire/pipewire.conf.d/ruby-mic.conf` does the same with a filter-chain source ("Internal Microphone", `ruby_mic`): an 80 Hz high-pass and +36 dB in two `linear` stages (the builtin clamps `Mult` to 10). It outranks the raw mic and yields to a plugged-in headset mic.
+
+## Keyboard backlight
+
+`cros_kbd_led_backlight` exposes `chromeos::kbd_backlight` (0–100). `brightnessctl -d chromeos::kbd_backlight set 40%` works without root through logind, and `systemd-backlight` restores the level at boot. The ChromeOS convention is Alt plus the screen-brightness keys.
 
 ## Display
 

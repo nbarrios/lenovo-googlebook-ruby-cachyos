@@ -1,62 +1,71 @@
-# Omarchy on ASUS Googlebook
+# CachyOS on Lenovo Googlebook 15
 
-An experimental route to native **Omarchy 4.0.4 on ASUS Googlebook 14 (CX9406CAA / Google Lapis)**, using the factory firmware and an encrypted internal drive.
+An experimental route to native **CachyOS on the Lenovo Googlebook 15 (Google Ruby)**, using the factory firmware, an encrypted internal drive and no firmware replacement. It is a fork of [Omarchy on ASUS Googlebook](https://github.com/jmklex/asus-googlebook-omarchy), whose boot path this port reuses.
 
-The original procedure booted a full Omarchy desktop from the internal 512 GB NVMe with the USB removed. Display, keyboard/touchpad, Wi-Fi, hardware rendering and audible speaker playback were verified on one laptop on **7 October 2026**, including a subsequent internal boot. This repository turns that work into a reproducible image builder, staged installation tools and recovery documentation.
+**Early experimental release, tested on one laptop.** Everything below was verified on a single Ruby (512 GB, firmware `Google_Ruby.16650.143.0`) in October 2026. Other capacities, SKUs or firmware versions are untested, and the installer refuses partition layouts it has not seen. This is a community project, unaffiliated with Lenovo, Google, ASUS, CachyOS or Omarchy.
 
-> **This fork adds the Lenovo Googlebook 15 (Google Ruby) with CachyOS.** It reuses the Lapis boot path and adds a CachyOS installer, Ruby audio (SOF, TAS2563 amplifiers with factory calibration, Dolby DAX), 120 Hz display power management, a kernel-update workflow driven by pacman hooks, and fingerprint support (USB FPMCU driver plus a patched libfprint). Start with [CachyOS on Ruby](docs/cachyos-ruby.md); the rest of this README describes the upstream Lapis/Omarchy project by [jmklex](https://github.com/jmklex/asus-googlebook-omarchy).
->
-> **Built with AI assistance.** The Ruby port (code, patches and documentation) was developed with substantial help from an AI assistant, Anthropic's Claude, working under the direction of the maintainer and tested on one physical laptop. Review the scripts before running them as root.
+> **Built with AI assistance.** The Ruby port (code, patches and documentation) was developed with substantial help from an AI assistant, Anthropic's Claude, working under the direction of the maintainer, and tested on that one laptop. Read the scripts before running them as root.
 
-**Early experimental release.** The generalized installation scripts have not yet completed a fresh installation on a second laptop. Do not treat software tests or a successful image build as another physical installation. Start with the live USB and stop if your hardware differs. This is a community project, unaffiliated with ASUS, Google or Omarchy.
+## What works
+
+| Area | Status on Ruby |
+| --- | --- |
+| Install and boot | LUKS2 + Btrfs on the internal NVMe; typed disk password at boot |
+| Display | 2880×1800 OLED at 120 Hz; Xe display power saving on (DC6, Panel Replay verified active) |
+| Input | Keyboard, keyboard backlight, touchpad, touchscreen |
+| Wi-Fi | Intel CNVi |
+| Speakers | SOF + 4× TAS2563 with Lenovo's tuning and **factory per-speaker calibration** from VPD; Dolby DAX |
+| Headphones and microphones | Headset auto-switch; internal mics with a +36 dB PipeWire boost |
+| Fingerprint reader | USB FPMCU via an out-of-tree `cros_ec_usb` DKMS driver and a patched libfprint; works for `sudo` and the Noctalia lock screen |
+| Kernel updates | `pacman -Syu` stages and validates the new signed boot images; one command writes them |
+| Not tested | Suspend/resume, camera, Bluetooth, battery life, external displays beyond a basic dock |
 
 ## Start here
 
-1. Read [support and limitations](docs/support.md). Only the tested **512 GB Lapis partition layout** is accepted by the native installer.
-2. Back up your files and make a separate [factory recovery USB](docs/recovery.md).
-3. [Build and test the live USB](docs/live-usb.md). This stage runs in RAM; it does not install to the internal drive. Bootloader unlocking itself erases factory user data.
-4. After a successful live test, follow [native encrypted installation](docs/install.md).
-5. Keep the recovery media and read [updates and troubleshooting](docs/maintenance.md).
+1. Read [CachyOS on Ruby](docs/cachyos-ruby.md) end to end. It lists every difference from the upstream Lapis procedure.
+2. Back up your files and make a separate [Googlebook recovery USB](docs/recovery.md). **Unlocking the bootloader erases the device.**
+3. [Build and test the live USB](docs/live-usb.md) with `tools/build_live.py --console-only`. This runs in RAM and does not touch the internal drive.
+4. Install with `tools/native.py` and `tools/configure_cachyos.py` ([procedure](docs/cachyos-ruby.md#procedure-root-console-only-live-session)).
+5. After the first boot, run the audio and fingerprint installers. Kernel updates then go through `pacman -Syu` and `kernel_update.py commit`.
 
-You need an advanced Linux workflow, a second computer, a dedicated live USB (16 GB or larger), separate Googlebook recovery media, and external storage for private backups. A stock Omarchy full-disk installation is incompatible with this boot path.
+You need an advanced Linux workflow, a second computer, a dedicated live USB (16 GB or larger), separate recovery media, and an ext4 drive for private backups.
 
 ## How it boots
 
 ```text
 Factory Depthcharge firmware, developer mode
   → AVB-signed Android v4 boot / init_boot / vendor_boot / vbmeta, slot A
-  → Linux 7.2.4 + small initramfs + typed LUKS password
-  → encrypted Btrfs root → Lapis graphics/audio setup → full Omarchy desktop
+  → linux-cachyos + small initramfs + typed LUKS password
+  → encrypted Btrfs root → Xe graphics, then SOF audio → niri/Noctalia or any desktop
 ```
 
-No replacement firmware, ExpertBook BIOS, or UEFI conversion is involved. Installation formats `userdata`, replaces the four slot-A boot images, renames the two `pvmfw` GPT labels, and clears only the pending Android recovery command. Partition offsets and sizes stay intact. Slot B remains backed up and unmodified, but **is not a working factory-OS fallback after userdata is reformatted**.
+Installation formats `userdata`, replaces the four slot-A boot images, renames the two `pvmfw` GPT labels and clears only the pending Android recovery command. Partition offsets and sizes stay intact. The factory `super` partition is left untouched; the audio installer reads Lenovo's firmware from it. Slot B is backed up and unmodified, but **is not a working factory-OS fallback once userdata is reformatted**. Background: [technical notes](docs/architecture.md).
 
-The board needs a checked Xe driver reload before graphical clients start, with SOF audio loaded afterwards. Audio uses a topology-specific quirk. The boot images also require a four-byte boundary between concatenated ramdisks. See [technical notes](docs/architecture.md).
-
-## Included
+## What this fork adds
 
 | Component | Purpose |
 | --- | --- |
-| `tools/build_live.py` | Build from one checksum-pinned official ISO; no raw disk access |
-| `tools/write_usb.py` | Explicit USB selection, preflight, typed confirmation and read-back |
-| `tools/native.py` | Hardware/layout checks, private backup, format, boot build, validation and commit |
-| `tools/configure_target.py` | Full ISO package set, official Omarchy provisioning and Lapis configuration |
-| `assets/installed/` | Graphics service and small encrypted-root initramfs configuration |
-| `tools/build_loader.py` | Build a read-only ChromiumOS Android-loader harness |
-| `tests/` | Corrupt-GPT, output-boundary, archive and write-failure checks |
+| `tools/configure_cachyos.py` | Network install of CachyOS `x86-64-v3` packages and the Ruby configuration |
+| `tools/kernel_update.py` | Pacman hooks that preserve modules and build, sign and loader-validate new boot images; `commit`, `confirm` and `rollback` (also from the live USB) |
+| `tools/install_ruby_audio.sh` | SOF, TAS2563 tuning, Dolby DAX firmware and UCM, extracted from the laptop's own factory partition |
+| `assets/installed/ruby-speaker-calibration.*` | Loads the factory speaker calibration from coreboot VPD at boot |
+| `assets/installed/pipewire/ruby-mic.conf` | Internal-microphone gain |
+| `assets/installed/cros-ec-usb/`, `tools/install_fingerprint_driver.sh` | DKMS package of Google's USB transport for the fingerprint MCU |
+| `assets/packages/libfprint-crfpmoc/`, `tools/install_fingerprint_userspace.sh` | libfprint with the ChromeOS match-on-chip driver and Ruby fixes |
+| `docs/research/fingerprint.md` | Sources and security model for the fingerprint work |
 
-Builds download pinned public source dependencies. No disk passwords, Wi-Fi profiles, SSH keys, device backups, disk GUIDs or private logs are shipped. Fresh local AVB signing keys are generated per build. The live image has a local root console and passwordless live sudo; SSH is disabled by default. The installed system has a locked root password, password-protected sudo, disk encryption and no enabled SSH service.
+The upstream Lapis/Omarchy tools (`tools/configure_target.py`, the Hyprland live desktop) remain and are documented in [install.md](docs/install.md), [support.md](docs/support.md) and [maintenance.md](docs/maintenance.md).
+
+## What is not shipped
+
+No OS image, Lenovo/Google/ASUS firmware, disk passwords, Wi-Fi profiles, SSH keys, AVB private keys, device backups, disk GUIDs or private logs. Each installation generates its own AVB signing key. The fingerprint seed is generated on the device and stays in `/var/lib/fprint`. See [NOTICE.md](NOTICE.md) for third-party code and licenses.
 
 ## Contributing
 
-Report the exact SKU, firmware version, storage capacity, stage and visible result using the issue templates. Keep serial numbers, network names, addresses, disk UUIDs, passwords and backups out of issues. New capacity/layout support needs actual device evidence and recovery testing; do not remove the guards to force an install. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-[Validation record](docs/validation.md) separates physical evidence from repository checks.
+Reports from other Ruby units are very welcome: exact SKU, firmware version, storage capacity, the stage you reached and what you saw. Keep serial numbers, network names, addresses, disk UUIDs, passwords and backups out of issues. Do not remove the layout guards to force an install. See [CONTRIBUTING.md](CONTRIBUTING.md) and the [validation record](docs/validation.md).
 
 ## License and attribution
 
-The original project code and documentation use the [MIT License](LICENSE). You may use, modify and redistribute them, including commercially. Keep the copyright and license notice in copies or substantial portions.
+Project code and documentation are under the [MIT License](LICENSE), as upstream. Kernel code in `assets/installed/cros-ec-usb/` is GPL-2.0 and the libfprint patches are LGPL-2.1-or-later; see [NOTICE.md](NOTICE.md).
 
-Suggested credit: **Jonathan Kleiman — [Omarchy on ASUS Googlebook](https://github.com/jonathankleiman/asus-googlebook-omarchy)**. No additional permission or payment is required. This suggested wording adds no conditions to MIT.
-
-The ChromiumOS-derived test harness and other upstream components retain their own licenses and attribution; see [NOTICE.md](NOTICE.md).
+The Lapis boot path, toolkit and recovery procedure are the work of **Jonathan Kleiman — [Omarchy on ASUS Googlebook](https://github.com/jmklex/asus-googlebook-omarchy)**. Please credit the upstream project as well as this fork.
