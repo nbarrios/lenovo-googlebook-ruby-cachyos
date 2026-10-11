@@ -290,4 +290,4 @@ sudo ~/googlebook-ruby/tools/kernel_update.py prepare --no-upgrade
 sudo /opt/lapis-kit/tools/kernel_update.py commit
 ```
 
-Reboot, type the disk password, and check that `findmnt /` shows `/dev/mapper/cachyos-root`. The confirm timer then settles the update as usual.
+Reboot, type the disk password, and check that `findmnt /` shows `/dev/mapper/cachyos-root`. The confirm timer then settles the update as usual. Verified on the development laptop, 11 October 2026.
