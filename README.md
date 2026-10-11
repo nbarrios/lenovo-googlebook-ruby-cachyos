@@ -21,7 +21,8 @@ An experimental route to native **CachyOS on the Lenovo Googlebook 15 (Google Ru
 | Suspend | s2idle reaches S0ix; about 0.35 %/hour overnight; power key and lid suspend |
 | Camera and Bluetooth | UVC camera; Bluetooth audio with AAC and headset microphone |
 | External display | USB-C DisplayPort (hotplug after resume verified) and the built-in HDMI port |
-| Not tested | Thunderbolt docks, multiple external displays, 4K or high-refresh external monitors, deep sleep (S3) |
+| Thunderbolt | Thunderbolt 3 dock (USB, charging) authorized by `bolt`, including after resume and replug |
+| Not tested | Displays through a Thunderbolt dock, multiple external displays, 4K or high-refresh external monitors, deep sleep (S3) |
 
 ## Start here
 

@@ -107,6 +107,10 @@ Microphones: there is no NHLT table, so `ruby-audio.conf` sets `dmic_num=4`. The
 
 The integrated camera is USB UVC (`30c9:013f`, `uvcvideo`, no setup): `/dev/video0` offers MJPG up to 2592×1944 and 1920×1080 at 30 fps, and YUYV up to 640×480 at 30 fps; `/dev/video1` is its metadata node. Verified in Chrome, 11 October 2026.
 
+## Thunderbolt
+
+The Thunderbolt/USB4 controller runs at security level `user` with IOMMU DMA protection, so a dock does nothing until `boltd` authorizes it. `configure_cachyos.py` installs `bolt`; on older installs run `pacman -S bolt`. Enroll a dock once with `boltctl enroll --policy auto <uuid>` (the UUID is in `boltctl list`); bolt records the policy as `iommu` and then authorizes the dock on every plug-in. Verified 11 October 2026 with a Belkin Thunderbolt 3 Dock Plus (40 Gb/s, USB Power Delivery charging, USB and its Realtek Ethernet adapter enumerated, a USB mouse working), including after resume and after unplugging and replugging. Plugging in a dock logs `cros_ec_ucsi ... UCSI_GET_PDOS failed (-5)`, and a resume with a dock attached logged `failed to re-enable notifications (-110)` again; neither affected charging or hotplug. Displays through the dock are untested.
+
 ## Bluetooth
 
 Intel CNVi Bluetooth (`hci0`, bluez 5.87) works without setup; pair from Noctalia's control center or `bluetoothctl`. The kernel logs `Failed to send Intel_Write_DDC (-95)` at startup; it is harmless. Verified 11 October 2026 with earbuds: playback uses A2DP with AAC, and opening the headset microphone makes WirePlumber switch to HFP with mSBC (16 kHz), then back to A2DP when recording stops. The first second or so of a recording is lost during that switch. The internal-microphone boost does not apply to Bluetooth microphones.

@@ -25,6 +25,7 @@ PACKAGES = [
     'cachyos-keyring', 'cachyos-mirrorlist', 'cachyos-v3-mirrorlist', 'cachyos-settings', 'cachyos-fish-config',
     'networkmanager', 'pipewire', 'pipewire-pulse', 'pipewire-alsa', 'wireplumber',
     'mesa', 'vulkan-intel', 'intel-media-driver', 'snapper',
+    'bolt',  # Thunderbolt security level is 'user': docks need boltd to authorize them
 ]
 # Ruby runs Xe display power features at driver defaults (verified at 120 Hz,
 # 10 October 2026: DC5/DC6 entered, Panel Replay selective update chosen).
