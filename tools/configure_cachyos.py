@@ -26,9 +26,9 @@ PACKAGES = [
     'networkmanager', 'pipewire', 'pipewire-pulse', 'pipewire-alsa', 'wireplumber',
     'mesa', 'vulkan-intel', 'intel-media-driver', 'snapper',
 ]
-# DC states, FBC, DSB and SAGV verified on Ruby at 120 Hz (10 October 2026); panel
-# self-refresh stays off until tested.
-XE_OPTIONS = 'gsc_firmware_path= enable_panel_replay=0 enable_psr=0'
+# Ruby runs Xe display power features at driver defaults (verified at 120 Hz,
+# 10 October 2026: DC5/DC6 entered, Panel Replay selective update chosen).
+XE_OPTIONS = 'gsc_firmware_path='
 
 
 def pacman_conf(live):

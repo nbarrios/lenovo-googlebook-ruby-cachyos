@@ -99,7 +99,7 @@ Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby modul
 
 ## Display
 
-The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block). Xe feature switches live only in `/etc/modprobe.d/ruby-xe.conf`, not the kernel command line, so changing them needs a reboot but no boot-set rebuild. DC states, FBC, DSB and SAGV are at driver defaults (verified 10 October 2026); `enable_psr=0 enable_panel_replay=0` remain until panel self-refresh is tested. Systems installed earlier: remove the `xe.enable_*` entries from `/etc/kernel/cmdline`, then `kernel_update.py prepare --no-upgrade` and `commit`.
+The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block). Xe feature switches live only in `/etc/modprobe.d/ruby-xe.conf`, not the kernel command line, so changing them needs a reboot but no boot-set rebuild. All Xe display power features run at driver defaults (10 October 2026: stable at 120 Hz, DC3→DC5→DC6 entered, driver selects Panel Replay with selective update, which disables FBC). To fall back, add `enable_panel_replay=0 enable_psr=0` (then `enable_fbc=0 enable_dsb=0 enable_sagv=0 enable_dc=0`) to the `options xe` line and reboot. Systems installed earlier: remove the `xe.enable_*` entries from `/etc/kernel/cmdline`, then `kernel_update.py prepare --no-upgrade` and `commit`.
 
 ## Kernel updates
 
