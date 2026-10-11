@@ -20,7 +20,7 @@ Experimental port of the Lapis procedure to the Lenovo Googlebook 15 (DMI `Googl
 - `tools/configure_cachyos.py` replaces `tools/configure_target.py`. It installs CachyOS `x86-64-v3` packages **over the network** (Panther Lake has AVX2, no AVX-512), with `linux-cachyos`.
 - Xe is blacklisted during early boot (LUKS prompt on the coreboot framebuffer), then `ruby-gpu.service` loads it once.
 - First boot is a **text login** (`multi-user.target`). niri/Noctalia and audio come after.
-- `linux-cachyos` and its headers are pinned (`IgnorePkg` plus a pacman hook). The running kernel lives in signed Android partitions; updating it means rebuilding, validating and committing a new boot set.
+- The running kernel lives in signed Android partitions, not `/boot`. Pacman hooks preserve its modules and build and validate a new boot set when `linux-cachyos` changes; writing it to the disk stays a manual `kernel_update.py commit`.
 
 ## Preparation
 
@@ -75,7 +75,7 @@ uname -r                          # the pinned *-cachyos release
 systemctl status ruby-gpu.service
 systemctl --failed
 nmtui                             # connect Wi-Fi
-sudo pacman -Syu                  # kernel stays pinned
+sudo pacman -Syu                  # a kernel upgrade is staged, not written
 sudo pacman -S niri noctalia noctalia-greeter xwayland-satellite
 ```
 
@@ -99,20 +99,31 @@ Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby modul
 
 ## Kernel updates
 
-`linux-cachyos` is pinned (`IgnorePkg`), and a pacman hook blocks any change to `usr/lib/modules/*/vmlinuz` unless `tools/kernel_update.py` holds its one-time pass. Update in two steps, rebooting between them:
+Kernel upgrades arrive with ordinary `pacman -Syu`. Only the disk write is manual:
 
 ```sh
-sudo pacman -Syu                                   # everything except the kernel
-sudo ~/googlebook-ruby/tools/kernel_update.py prepare
-sudo ~/googlebook-ruby/tools/kernel_update.py commit
+sudo pacman -Syu                                   # stages and validates a new kernel
+sudo /opt/lapis-kit/tools/kernel_update.py commit  # y/N, shows the version
 systemctl reboot                                   # unlock, log in
-sudo ~/googlebook-ruby/tools/kernel_update.py confirm
 ```
 
-`prepare` keeps a reflinked copy of the running kernel's modules, installs the new kernel, restores the old modules so the running system and any rollback keep working, builds the small encrypted-root initramfs, signs the four slot-A images with the device's AVB key (`/etc/asus-boot/avb-private.pem`), and validates them with the ChromiumOS Android loader against the live partition table. It writes nothing to the boot partitions.
+Two pacman hooks, triggered by any change to `usr/lib/modules/*/vmlinuz`, run `/opt/lapis-kit/tools/kernel_update.py` (root-owned; never code in a home directory):
 
-`commit` backs up the current slot-A images under `/var/lib/asus-boot/kernel-update/slots/`, writes the validated set with read-back, and restores every attempted region on a write error. `confirm` (on the new kernel) drops the preserved modules and keeps the two newest backups.
+- `05-asus-kernel-snapshot.hook` (PreTransaction, `hook-pre`) reflink-copies the running kernel's module tree, and slot A's if the state record names a different one, to `/var/lib/asus-boot/kernel-update/modules/`. It aborts the transaction if a committed update is not yet confirmed, or if it finds no module tree to protect (for example `pacman` in a chroot from the live USB; `KERNEL_UPDATE_UNPROTECTED=1` overrides).
+- `zz-asus-kernel-stage.hook` (PostTransaction, after depmod and mkinitcpio, `hook-post`) restores those trees if the package removed them, builds the small encrypted-root initramfs with `/etc/asus-boot/mkinitcpio.conf`, signs the four slot-A images with the device's AVB key (`/etc/asus-boot/avb-private.pem`) and validates them with the ChromiumOS Android loader against the live partition table. It writes nothing to the boot partitions. On success it prints `Kernel X staged and validated`. On failure the new package stays installed but slot A still boots the old kernel; fix the cause and retry with `sudo /opt/lapis-kit/tools/kernel_update.py prepare --no-upgrade`.
 
-If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition as `omarchy_root`, mount subvolume `@` on `/mnt`, then run `kernel_update.py rollback --root /mnt` from the kit. From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`.
+`commit` backs up the current slot-A images under `/var/lib/asus-boot/kernel-update/slots/`, writes the validated set with read-back, and restores every attempted region on a write error. `asus-kernel-confirm.timer` runs `confirm --auto` ten minutes after boot; it acts only when the state is `committed` and `uname -r` is the new kernel, then drops the preserved modules and keeps the two newest backups. Run `confirm` by hand to do it sooner.
+
+If the new kernel does not boot: start the live USB, `cryptsetup open` the userdata partition as `omarchy_root`, mount subvolume `@` on `/mnt`, then run `python3 /mnt/opt/lapis-kit/tools/kernel_update.py rollback --root /mnt` (typed confirmation). From a working system, `kernel_update.py rollback` restores the previous set. `prepare --no-upgrade` rebuilds the boot set for the installed kernel, for example after changing `/etc/asus-boot/mkinitcpio.conf`; `prepare` alone runs `pacman -S linux-cachyos linux-cachyos-headers` and lets the hooks stage it. Running `prepare`, `commit` or `install-hooks` from a checkout first copies its `lapis/` and `tools/` to `/opt/lapis-kit`, so the hooks and the rescue copy match the code you ran.
+
+### Migrating from the pinned kernel
+
+Systems installed before the hooks pin `linux-cachyos` with `IgnorePkg` and a blocking guard hook. With no update pending (`kernel_update.py status`), run once from the checkout:
+
+```sh
+sudo ~/googlebook-ruby/tools/kernel_update.py install-hooks
+```
+
+It refreshes `/opt/lapis-kit/{lapis,tools}` as root-owned copies, writes both hooks and the confirm service and timer, removes `00-asus-kernel-guard.hook` and `/usr/local/libexec/asus-boot-update-guard`, and removes only `linux-cachyos` and `linux-cachyos-headers` from `IgnorePkg` in `/etc/pacman.conf`, keeping a backup at `/etc/pacman.conf.kernel-pin.bak`.
 
 First physical upgrade, 7.2.9-1 to 7.2.9-2-cachyos, completed on 10 October 2026: prepare, commit, reboot and confirm, with audio, Xe and speaker calibration working afterwards.

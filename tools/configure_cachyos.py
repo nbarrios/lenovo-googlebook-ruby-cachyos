@@ -12,7 +12,7 @@ from lapis.common import (ROOT, CACHYOS_INITRAMFS, CACHYOS_KERNEL, CACHYOS_KEY, 
                           read_json, require, run, save_json, sha256)
 from tools.native import STATE, TARGET, current, mounted, checked_backup
 from tools.configure_target import put, mask, chroot
-from tools.kernel_update import GUARD as KERNEL_GUARD
+from tools.kernel_update import SYSTEM_FILES as KERNEL_FILES, TIMER as KERNEL_TIMER
 
 # Panther Lake has AVX2 but no AVX-512: x86-64-v3 builds.
 CACHYOS_SERVERS = ['https://cdn77.cachyos.org/repo/{arch}/$repo', 'https://us.cachyos.org/repo/{arch}/$repo']
@@ -132,11 +132,12 @@ def configure(args):
     chroot('systemctl', 'enable', 'ruby-gpu.service', 'NetworkManager.service', 'systemd-resolved.service', 'systemd-timesyncd.service')
     chroot('systemctl', 'mask', 'sshd.service', 'efi.mount', 'efi.automount')
     chroot('systemctl', 'set-default', 'multi-user.target')
-    # Kernel pin: the running kernel lives in signed Android partitions, not /boot.
-    conf = pacman_conf(live=False).replace('[options]\n', '[options]\nIgnorePkg = ' + ' '.join(KERNEL_PKGS) + '\n', 1)
-    put('/etc/pacman.conf', conf)
-    put('/usr/local/libexec/asus-boot-update-guard', KERNEL_GUARD, 0o755)
-    put('/etc/pacman.d/hooks/00-asus-kernel-guard.hook', '[Trigger]\nOperation = Upgrade\nOperation = Install\nOperation = Remove\nType = Path\nTarget = usr/lib/modules/*/vmlinuz\n[Action]\nDescription = Protect kernel and Android boot pair\nWhen = PreTransaction\nExec = /usr/local/libexec/asus-boot-update-guard\nAbortOnFail\n')
+    # Kernel: the running kernel lives in signed Android partitions, not /boot. Pacman hooks
+    # preserve its modules and stage a validated boot set; only kernel_update.py commit writes it.
+    put('/etc/pacman.conf', pacman_conf(live=False))
+    for name, text in KERNEL_FILES.items():
+        put('/' + name, text)
+    chroot('systemctl', 'enable', KERNEL_TIMER)
     put('/etc/asus-boot/mkinitcpio.conf', (ROOT / 'assets/installed/mkinitcpio.conf').read_text())
     save_json(TARGET / 'etc/asus-boot/install.json', p)
     (TARGET / 'etc/asus-boot/luks-header.bin').write_bytes((backup / 'luks-header.bin').read_bytes())
