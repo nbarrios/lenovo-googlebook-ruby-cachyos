@@ -38,6 +38,7 @@ install -Dm644 "$assets/ucm2/sof-rt5682/sof-rt5682.conf" /usr/share/alsa/ucm2/co
 install -Dm644 "$assets/ucm2/sof-rt5682/HiFi.conf" /usr/share/alsa/ucm2/conf.d/sof-rt5682/HiFi.conf
 install -Dm755 "$assets/ruby-speaker-calibration.py" /usr/local/libexec/ruby-speaker-calibration
 install -Dm644 "$assets/ruby-speaker-calibration.service" /etc/systemd/system/ruby-speaker-calibration.service
+install -Dm644 "$assets/pipewire/ruby-mic.conf" /etc/pipewire/pipewire.conf.d/ruby-mic.conf
 systemctl daemon-reload
 systemctl enable ruby-speaker-calibration.service
 echo 'Ruby audio installed; reboot to load SOF with the amplifier firmware.'
