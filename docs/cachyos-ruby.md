@@ -99,6 +99,10 @@ Dolby DAX: Lenovo ships a Ruby-specific SOF firmware with a built-in Dolby modul
 
 Microphones: there is no NHLT table, so `ruby-audio.conf` sets `dmic_num=4`. The DMICs are rated -26 dBFS at 94 dB SPL and SOF capture gain tops out at 0 dB, so speech arrives near -60 dBFS. Googlebook OS added gain in software; `/etc/pipewire/pipewire.conf.d/ruby-mic.conf` does the same with a filter-chain source ("Internal Microphone", `ruby_mic`): an 80 Hz high-pass and +36 dB in two `linear` stages (the builtin clamps `Mult` to 10). It outranks the raw mic and yields to a plugged-in headset mic.
 
+## Suspend and power key
+
+`s2idle` (the default in `/sys/power/mem_sleep`) works: on 10 October 2026 a 30 s RTC-woken suspend spent 30.06 s in S0ix (`slp_s0_residency_usec`), resumed with no Xe, SOF, Wi-Fi or `cros_ec_usb` errors, Wi-Fi reassociated within about 4 s, and audio, input and `fprintd-verify` worked afterwards. `tools/test_suspend.sh` repeats the check. `ruby-power-key.conf` in `/etc/systemd/logind.conf.d/` makes a short power-key press suspend and a long press shut down (logind's default is to power off on a short press).
+
 ## Keyboard backlight
 
 `cros_kbd_led_backlight` exposes `chromeos::kbd_backlight` (0–100). `brightnessctl -d chromeos::kbd_backlight set 40%` works without root through logind, and `systemd-backlight` restores the level at boot. The ChromeOS convention is Alt plus the screen-brightness keys.

@@ -127,6 +127,7 @@ def configure(args):
     put('/etc/modprobe.d/ruby-xe.conf', 'blacklist xe\noptions xe ' + XE_OPTIONS + '\n')
     put('/etc/systemd/system/ruby-gpu.service', (ROOT / 'assets/installed/ruby-gpu.service').read_text())
     put('/etc/modprobe.d/ruby-audio.conf', (ROOT / 'assets/installed/ruby-audio.conf').read_text())
+    put('/etc/systemd/logind.conf.d/ruby-power-key.conf', (ROOT / 'assets/installed/logind/ruby-power-key.conf').read_text())
     # The factory ESP and Android partitions must not be auto-mounted.
     mask('/etc/systemd/system-generators/systemd-gpt-auto-generator')
     resolv = TARGET / 'etc/resolv.conf'; resolv.unlink(missing_ok=True); resolv.symlink_to('../run/systemd/resolve/stub-resolv.conf')
