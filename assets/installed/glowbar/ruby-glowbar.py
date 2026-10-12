@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Drive Ruby's glowbar (the EC's four-segment lightbar) from desktop state.
 
-Priority: dictation (hyprwhspr recording) > battery (on AC, green segments filling from
-the left while charging, solid green when not; amber or red when low on battery) > accent colour > off. The bar is off while the
-session is locked, the panel is off or the lid is closed. The EC rejects the
-lightbar's built-in sequences, so every frame is set from here.
+Priority: dictation (hyprwhspr recording) > battery (on AC, green segments to the
+charge level with the filling segment breathing from yellow to green, solid green
+when not charging; amber or red when low on battery) > accent colour > off. The
+bar is off while the session is locked, the panel is off or the lid is closed.
+The EC rejects the lightbar's built-in sequences, so every frame is set from here.
 
 Needs write access to the lightbar's led_rgb (90-ruby-glowbar.rules grants it
 to the video group). The accent comes from Noctalia's theme as rendered for
@@ -32,10 +33,9 @@ SEGMENTS = 4
 OFF = (0, 0, 0)
 FALLBACK_ACCENT = (80, 60, 255)
 RECORD = (255, 0, 0)   # fixed: the bar's strong blue LEDs turn the theme's red magenta
-CHARGING, AMBER, RED = (0, 255, 40), (255, 90, 0), (255, 0, 0)
+CHARGING, FILLING, AMBER, RED = (0, 255, 40), (255, 200, 0), (255, 90, 0), (255, 0, 0)
 LOW, CRITICAL = 20, 10           # battery percent on battery power
 TICK, STATE_EVERY, REFRESH_EVERY = 0.1, 1.0, 10.0
-CHARGE_STEP = 0.5                # seconds per step of the charging animation
 
 
 def read(path, default=''):
@@ -78,10 +78,14 @@ def scale(colour, k):
     return tuple(round(c * k) for c in colour)
 
 
-def charging(now):
-    """Segments fill one by one from the left, then all go off, and repeat."""
-    step = int(now / CHARGE_STEP) % (SEGMENTS + 1)
-    return [CHARGING if i <= step and step < SEGMENTS else OFF for i in range(SEGMENTS)]
+def charging(percent, pulse):
+    """Completed segments solid green; the segment being filled breathes, shifting
+    from yellow to green as it nears completion."""
+    level = max(0.0, min(1.0, percent / 100)) * SEGMENTS
+    full = min(int(level), SEGMENTS - 1)
+    progress = level - full
+    blend = tuple(round(y + (g - y) * progress) for y, g in zip(FILLING, CHARGING))
+    return [CHARGING] * full + [scale(blend, pulse)] + [OFF] * (SEGMENTS - full - 1)
 
 
 class Glowbar:
@@ -92,10 +96,13 @@ class Glowbar:
     def show(self, frame, force=False):
         if frame == self.shown and not force:
             return
+        # The kernel spaces lightbar commands interval_msec (50 ms) apart, so send as few
+        # as possible: LED 4 sets all segments at once, otherwise only changed segments.
         if len(set(frame)) == 1:
-            text = '4 %d %d %d' % frame[0]           # LED 4 sets all segments in one EC command
+            text = '4 %d %d %d' % frame[0]
         else:
-            text = ' '.join('%d %d %d %d' % (i, *c) for i, c in enumerate(frame))
+            changed = [i for i in range(SEGMENTS) if force or not self.shown or frame[i] != self.shown[i]]
+            text = ' '.join('%d %d %d %d' % (i, *frame[i]) for i in changed)
         try:
             (LIGHTBAR / 'led_rgb').write_text(text)
             self.shown = frame
@@ -144,7 +151,7 @@ def main():
         elif s['recording']:
             frame = [scale(RECORD, pulse)] * SEGMENTS
         elif s['ac']:
-            frame = charging(now) if s['charging'] else [CHARGING] * SEGMENTS
+            frame = charging(s['percent'], pulse) if s['charging'] else [CHARGING] * SEGMENTS
         elif s['percent'] <= CRITICAL:
             frame = [scale(RED, pulse)] * SEGMENTS
         elif s['percent'] <= LOW:
