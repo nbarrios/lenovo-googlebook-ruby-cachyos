@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Drive Ruby's glowbar (the EC's four-segment lightbar) from desktop state.
 
-Priority: dictation (hyprwhspr recording) > battery (green fill level on AC, the
-top segment breathing while charging; amber or red when low on battery) > accent colour > off. The bar is off while the
+Priority: dictation (hyprwhspr recording) > battery (on AC, green segments filling from
+the left while charging, solid green when not; amber or red when low on battery) > accent colour > off. The bar is off while the
 session is locked, the panel is off or the lid is closed. The EC rejects the
 lightbar's built-in sequences, so every frame is set from here.
 
@@ -35,6 +35,7 @@ RECORD = (255, 0, 0)   # fixed: the bar's strong blue LEDs turn the theme's red 
 CHARGING, AMBER, RED = (0, 255, 40), (255, 90, 0), (255, 0, 0)
 LOW, CRITICAL = 20, 10           # battery percent on battery power
 TICK, STATE_EVERY, REFRESH_EVERY = 0.1, 1.0, 10.0
+CHARGE_STEP = 0.5                # seconds per step of the charging animation
 
 
 def read(path, default=''):
@@ -77,15 +78,10 @@ def scale(colour, k):
     return tuple(round(c * k) for c in colour)
 
 
-def fill(colour, percent, breathe=None):
-    """Light segments in proportion to percent; the last lit segment is partial.
-    With breathe (0..1), the last lit segment pulses to show active charging."""
-    level = max(0.0, min(1.0, percent / 100)) * SEGMENTS
-    frame = [scale(colour, max(0.0, min(1.0, level - i))) for i in range(SEGMENTS)]
-    top = min(SEGMENTS - 1, max(0, math.ceil(level) - 1))
-    if breathe is not None:
-        frame[top] = scale(colour, breathe)
-    return frame
+def charging(now):
+    """Segments fill one by one from the left, then all go off, and repeat."""
+    step = int(now / CHARGE_STEP) % (SEGMENTS + 1)
+    return [CHARGING if i <= step and step < SEGMENTS else OFF for i in range(SEGMENTS)]
 
 
 class Glowbar:
@@ -148,7 +144,7 @@ def main():
         elif s['recording']:
             frame = [scale(RECORD, pulse)] * SEGMENTS
         elif s['ac']:
-            frame = fill(CHARGING, s['percent'], pulse if s['charging'] else None)
+            frame = charging(now) if s['charging'] else [CHARGING] * SEGMENTS
         elif s['percent'] <= CRITICAL:
             frame = [scale(RED, pulse)] * SEGMENTS
         elif s['percent'] <= LOW:
