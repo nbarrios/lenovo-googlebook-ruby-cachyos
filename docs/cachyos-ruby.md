@@ -131,6 +131,18 @@ The Intel Sensor Hub (ISH) needs Google's board firmware. linux-firmware only ha
 
 The EC drives the single fan on its own (`cros_ec` hwmon, `pwm1_enable=2` automatic) from its CPU sensor; `acpi_fan` reports the same speed. Idle on 11 October 2026: about 2,740 rpm (PWM 84/255), package 43 °C. With all 8 cores of the Core Ultra 5 325 busy for two minutes, the CPU ran at about 3.3 GHz for the first ~15 s (package up to 91 °C, PL2 35 W), then held about 1.8 GHz at 66–68 °C under the 15 W long-term limit (PL1, 28 s window). The fan rose to about 4,250 rpm (PWM 153, 60%) and fell back over a minute of cooldown. No thermal throttling or critical-temperature messages were logged; sustained performance is set by the firmware's 15 W limit, not by temperature.
 
+The 15 W long-term limit (PL1) is not locked: root can raise it to the reported 25 W maximum through `/sys/class/powercap`, on both `intel-rapl:0` (MSR) and `intel-rapl-mmio:0` (the lower of the two applies). The SoC power slider is `platform_profile` (`low-power`, `balanced`, `performance`), managed by power-profiles-daemon. Two minutes of all-core load per setting on AC, performance profile:
+
+| PL1 | Sustained clock | Package | Fan |
+| --- | --- | --- | --- |
+| 15 W (stock, balanced) | ~1.8 GHz | 67 °C | ~4,100 rpm |
+| 20 W | ~2.24 GHz | 78 °C | ~4,330 rpm |
+| 22 W | ~2.39 GHz | 83 °C | ~4,390 rpm |
+| 24 W | ~2.55 GHz | 87–89 °C, still rising | ~4,400 rpm |
+| 25 W | 2.6–2.9 GHz, falling | 90–91 °C, held at the thermal target | ~4,500 rpm |
+
+Each run starts with about 30 s at the 35 W short-term limit. The EC's fan curve stops at about 63% whatever the CPU temperature, because it follows the EC's own sensor; above about 24 W the package reaches its 91 °C target and clocks fall. The optional `sudo tools/install_power_mode.sh` sets 22 W and the performance profile on AC and restores 15 W and balanced on battery: a service applies it at boot, a udev rule when AC changes, and a `system-sleep` hook after resume (verified 12 October 2026: AC unplug and replug, and suspend). Change `AC_WATTS` in `assets/installed/power/ruby-power-mode` for another limit.
+
 ## Glowbar
 
 The glowbar is the EC's lightbar (`cros_ec_lightbar`, protocol version 3, four segments numbered 0–3 from the left), under `/sys/class/chromeos/cros_ec/lightbar/`. Direct colour writes work (`echo "LED R G B" > led_rgb`, LED 4 for all segments; `brightness` 0–255), but the EC rejects the built-in sequences, programs and parameters (`INVALID_PARAM`), so any animation has to come from the host. The kernel's own suspend and resume sequences fail for the same reason, so nothing switches the bar off for sleep unless the host does.

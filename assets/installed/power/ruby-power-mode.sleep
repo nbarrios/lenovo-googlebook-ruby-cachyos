@@ -1,0 +1,4 @@
+#!/bin/sh
+# systemd-sleep hook: firmware may restore its own power limits on resume.
+[ "$1" = post ] && systemctl --no-block start ruby-power-mode.service
+exit 0

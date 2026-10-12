@@ -1,0 +1,20 @@
+#!/bin/sh
+# Ruby power mode: on AC, raise the sustained CPU power limit (PL1) and use the
+# performance profile; on battery, the firmware's 15 W and balanced. PL1 is set
+# on both RAPL interfaces (MSR and MMIO), since the lower of the two applies.
+# Measured 11 October 2026, all-core load, performance profile: 15 W 1.8 GHz
+# 67 C; 20 W 2.24 GHz 78 C; 22 W 2.39 GHz 83 C; 24 W 2.55 GHz 87-89 C and rising
+# toward the 91 C thermal target that throttles 25 W.
+AC_WATTS=22
+BATTERY_WATTS=15
+
+if [ "$(cat /sys/class/power_supply/AC/online 2>/dev/null)" = 1 ]; then
+    watts=$AC_WATTS profile=performance
+else
+    watts=$BATTERY_WATTS profile=balanced
+fi
+for rapl in /sys/class/powercap/intel-rapl:0 /sys/class/powercap/intel-rapl-mmio:0; do
+    [ -w "$rapl/constraint_0_power_limit_uw" ] && echo $((watts * 1000000)) > "$rapl/constraint_0_power_limit_uw"
+done
+powerprofilesctl set "$profile" 2>/dev/null || true
+echo "ruby-power-mode: PL1 ${watts} W, profile $profile"

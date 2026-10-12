@@ -1,0 +1,2 @@
+# Reapply the Ruby power mode when AC is connected or disconnected.
+ACTION=="change", SUBSYSTEM=="power_supply", KERNEL=="AC", RUN+="/usr/bin/systemctl --no-block start ruby-power-mode.service"

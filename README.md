@@ -57,6 +57,7 @@ Installation formats `userdata`, replaces the four slot-A boot images, renames t
 | `assets/installed/pipewire/ruby-mic.conf` | Internal-microphone gain |
 | `assets/installed/cros-ec-usb/`, `tools/install_fingerprint_driver.sh` | DKMS package of Google's USB transport for the fingerprint MCU |
 | `assets/packages/libfprint-crfpmoc/`, `tools/install_fingerprint_userspace.sh` | libfprint with the ChromeOS match-on-chip driver and Ruby fixes |
+| `assets/installed/power/`, `tools/install_power_mode.sh` | Optional: 22 W CPU power limit and performance profile on AC, stock on battery |
 | `assets/installed/glowbar/`, `tools/install_glowbar.sh` | Drives the glowbar: dictation, battery level and accent colour |
 | `docs/research/fingerprint.md` | Sources and security model for the fingerprint work |
 
