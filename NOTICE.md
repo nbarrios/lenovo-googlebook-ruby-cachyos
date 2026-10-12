@@ -17,7 +17,7 @@ The build downloads pinned **source code** from these projects. They retain thei
 
 `assets/packages/libfprint-crfpmoc/` holds a PKGBUILD and patches to [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint), which is LGPL-2.1-or-later. Patch `0001` is the unmodified diff of libfprint MR !512 (the `crfpmoc` driver); `0002`–`0005` are this project's changes and are offered under the same license as libfprint. The PKGBUILD is derived from the Arch Linux libfprint PKGBUILD.
 
-The Ruby audio setup does not redistribute Lenovo or Google firmware. `tools/install_ruby_audio.sh` extracts the TAS2563 tuning, the Ruby SOF firmware with Dolby DAX, its topology and the DAX parameters from the laptop's own untouched factory `super` partition at install time.
+The Ruby audio setup does not redistribute Lenovo or Google firmware. `tools/install_ruby_audio.sh` extracts the TAS2563 tuning, the Ruby SOF firmware with Dolby DAX, its topology and the DAX parameters from the laptop's own untouched factory `super` partition at install time. `tools/install_ruby_sensors.sh` likewise extracts Google's Intel Sensor Hub firmware for Ruby from the same partition.
 
 `tools/loader_harness.c` is a modified ChromiumOS test utility, governed by `tools/LICENSE.chromium`. It is a host simulation of the Android loader in developer mode, not ASUS firmware or a replacement firmware image. Its disk-write callback deliberately does not write.
 

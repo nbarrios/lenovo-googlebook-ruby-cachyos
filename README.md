@@ -30,7 +30,7 @@ An experimental route to native **CachyOS on the Lenovo Googlebook 15 (Google Ru
 2. Back up your files and make a separate [Googlebook recovery USB](docs/recovery.md). **Unlocking the bootloader erases the device.**
 3. [Build and test the live USB](docs/live-usb.md) with `tools/build_live.py --console-only`. This runs in RAM and does not touch the internal drive.
 4. Install with `tools/native.py` and `tools/configure_cachyos.py` ([procedure](docs/cachyos-ruby.md#procedure-root-console-only-live-session)).
-5. After the first boot, run the audio and fingerprint installers. Kernel updates then go through `pacman -Syu` and `kernel_update.py commit`.
+5. After the first boot, run the audio, sensor and fingerprint installers. Kernel updates then go through `pacman -Syu` and `kernel_update.py commit`.
 
 You need an advanced Linux workflow, a second computer, a dedicated live USB (16 GB or larger), separate recovery media, and an ext4 drive for private backups.
 
@@ -52,6 +52,7 @@ Installation formats `userdata`, replaces the four slot-A boot images, renames t
 | `tools/configure_cachyos.py` | Network install of CachyOS `x86-64-v3` packages and the Ruby configuration |
 | `tools/kernel_update.py` | Pacman hooks that preserve modules and build, sign and loader-validate new boot images; `commit`, `confirm` and `rollback` (also from the live USB) |
 | `tools/install_ruby_audio.sh` | SOF, TAS2563 tuning, Dolby DAX firmware and UCM, extracted from the laptop's own factory partition |
+| `tools/install_ruby_sensors.sh` | Google's sensor-hub firmware, from the same partition, for the ambient light sensor |
 | `assets/installed/ruby-speaker-calibration.*` | Loads the factory speaker calibration from coreboot VPD at boot |
 | `assets/installed/pipewire/ruby-mic.conf` | Internal-microphone gain |
 | `assets/installed/cros-ec-usb/`, `tools/install_fingerprint_driver.sh` | DKMS package of Google's USB transport for the fingerprint MCU |

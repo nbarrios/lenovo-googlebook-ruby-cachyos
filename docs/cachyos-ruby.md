@@ -123,6 +123,10 @@ Intel CNVi Bluetooth (`hci0`, bluez 5.87) works without setup; pair from Noctali
 
 The top row reports, left to right: `KEY_BACK`, `KEY_HOMEPAGE`, `KEY_SCALE` (overview, XKB `XF86LaunchA`), `KEY_FULL_SCREEN`, `KEY_SYSRQ` (screenshot, `Print`), brightness down and up, `KEY_KBDILLUMTOGGLE`, `KEY_MICMUTE`, `KEY_MUTE` and the volume keys; two further keys send `KEY_ACCESSIBILITY` and `KEY_DICTATE` (XKB `XF86Accessibility`, `XF86Dictate`, xkeyboard-config 2.48). All arrive on the `AT Translated Set 2 keyboard` device and need no remapping; bind them in the compositor.
 
+## Ambient light sensor
+
+The Intel Sensor Hub (ISH) needs Google's board firmware. linux-firmware only has Intel's generic `ish_ptl.bin`, with which the ISH exposes HID sensors (accelerometer, gyroscope, magnetometer, light) that all read 0. The factory `vendor_a` image carries `firmware/intel/ish/ish_ptl_62b0f067_6c687233.bin`, the name the kernel's ISH loader tries first on this board (CRC32 of the DMI vendor "Google" and product "Ruby"). `sudo tools/install_ruby_sensors.sh` extracts it into `/usr/lib/firmware/updates`; the ISH driver loads after the initramfs, so a reboot is enough. The ISH then reports `CrOS Integrated Sensor Hub MCU detected`, `cros_ec_ishtp` registers it, and `cros-ec-light` (IIO, `in_illuminance_input`) gives the ambient light level; the placeholder HID sensors disappear. Verified 11 October 2026: about 9 lux in a dim room, dropping to 1 when covered. `cros-ec-sensorhub ... unknown type 8` at boot is a sensor type the kernel does not support yet and is harmless. The firmware is loaded into the ISH at every boot, never flashed; deleting the file and rebooting returns to the generic firmware.
+
 ## Battery charge limit
 
 The EC's charge control (`cros_charge_control`) exposes `charge_control_start_threshold` and `charge_control_end_threshold` on `BAT0`; they reset at boot. The optional `assets/installed/udev/90-ruby-charge-limit.rules` holds the battery between 75 and 80% on AC:
