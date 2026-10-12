@@ -1,0 +1,6 @@
+# Optional battery charge limit for Ruby. The ChromeOS EC (cros_charge_control)
+# holds the battery between the start and end thresholds while on AC.
+# Either the battery or the charge-control driver can appear first at boot,
+# so the limit is applied on both events; the write that comes too early fails harmlessly.
+ACTION=="add", SUBSYSTEM=="power_supply", KERNEL=="BAT0", RUN+="/usr/bin/sh -c 'echo 75 > /sys/class/power_supply/BAT0/charge_control_start_threshold; echo 80 > /sys/class/power_supply/BAT0/charge_control_end_threshold'"
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="cros-charge-control", RUN+="/usr/bin/sh -c 'echo 75 > /sys/class/power_supply/BAT0/charge_control_start_threshold; echo 80 > /sys/class/power_supply/BAT0/charge_control_end_threshold'"

@@ -119,6 +119,22 @@ Intel CNVi Bluetooth (`hci0`, bluez 5.87) works without setup; pair from Noctali
 
 `cros_kbd_led_backlight` exposes `chromeos::kbd_backlight` (0–100). `brightnessctl -d chromeos::kbd_backlight set 40%` works without root through logind, and `systemd-backlight` restores the level at boot. The ChromeOS convention is Alt plus the screen-brightness keys.
 
+## Top-row keys
+
+The top row reports, left to right: `KEY_BACK`, `KEY_HOMEPAGE`, `KEY_SCALE` (overview, XKB `XF86LaunchA`), `KEY_FULL_SCREEN`, `KEY_SYSRQ` (screenshot, `Print`), brightness down and up, `KEY_KBDILLUMTOGGLE`, `KEY_MICMUTE`, `KEY_MUTE` and the volume keys; two further keys send `KEY_ACCESSIBILITY` and `KEY_DICTATE` (XKB `XF86Accessibility`, `XF86Dictate`, xkeyboard-config 2.48). All arrive on the `AT Translated Set 2 keyboard` device and need no remapping; bind them in the compositor.
+
+## Battery charge limit
+
+The EC's charge control (`cros_charge_control`) exposes `charge_control_start_threshold` and `charge_control_end_threshold` on `BAT0`; they reset at boot. The optional `assets/installed/udev/90-ruby-charge-limit.rules` holds the battery between 75 and 80% on AC:
+
+```sh
+sudo install -Dm644 assets/installed/udev/90-ruby-charge-limit.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --action=add /sys/class/power_supply/BAT0
+```
+
+Edit the two numbers in the rule for other limits.
+
 ## Display
 
 The Samsung ATNA53JB03 OLED runs at 2880x1800@120 (set in the niri output block). Xe feature switches live only in `/etc/modprobe.d/ruby-xe.conf`, not the kernel command line, so changing them needs a reboot but no boot-set rebuild. All Xe display power features run at driver defaults (10 October 2026: stable at 120 Hz, DC3→DC5→DC6 entered, driver selects Panel Replay with selective update, which disables FBC). On a still screen `i915_edp_psr_status` shows `ctl: enabled` and status `SLEEP`, and DC5→DC6 entries keep rising (28 in 10 s). External displays work on USB-C DisplayPort and on the built-in HDMI port (11 October 2026; HDMI tested with a 1920x1080@60 monitor; niri extends the desktop automatically). A 4K OLED monitor on USB-C offered 3840x2160 at 60, 120, 180 and 240 Hz and ran cleanly at 240 Hz; niri picks the monitor's preferred mode (60 Hz here), so set a higher rate with `niri msg output <name> mode ...` or a `mode` line in that output's block. To fall back, add `enable_panel_replay=0 enable_psr=0` (then `enable_fbc=0 enable_dsb=0 enable_sagv=0 enable_dc=0`) to the `options xe` line and reboot. Systems installed earlier: remove the `xe.enable_*` entries from `/etc/kernel/cmdline`, then `kernel_update.py prepare --no-upgrade` and `commit`.
