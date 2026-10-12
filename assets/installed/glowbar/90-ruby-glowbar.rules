@@ -1,0 +1,5 @@
+# Let the video group drive Ruby's glowbar (EC lightbar) for ruby-glowbar.
+# The lightbar attributes appear when cros-ec-lightbar binds; at coldplug the
+# platform device's add event comes after that, so both events are handled.
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="cros-ec-lightbar", RUN+="/usr/bin/sh -c 'cd /sys/class/chromeos/cros_ec/lightbar && chgrp video led_rgb brightness && chmod g+w led_rgb brightness'"
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="cros-ec-lightbar.*", RUN+="/usr/bin/sh -c 'cd /sys/class/chromeos/cros_ec/lightbar && chgrp video led_rgb brightness && chmod g+w led_rgb brightness'"

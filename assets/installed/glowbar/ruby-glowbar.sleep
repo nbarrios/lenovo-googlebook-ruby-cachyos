@@ -1,0 +1,5 @@
+#!/bin/sh
+# systemd-sleep hook: switch the glowbar off before suspend. The kernel's own
+# suspend sequence uses lightbar commands this EC rejects.
+[ "$1" = pre ] && printf '4 0 0 0' > /sys/class/chromeos/cros_ec/lightbar/led_rgb 2>/dev/null
+exit 0

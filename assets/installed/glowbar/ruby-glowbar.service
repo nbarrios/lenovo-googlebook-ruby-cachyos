@@ -1,0 +1,12 @@
+[Unit]
+Description=Ruby glowbar: dictation, battery and accent colour
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/libexec/ruby-glowbar
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
