@@ -7,7 +7,9 @@
 # HID sensors that always read 0. With Google's board file the ISH runs ChromeOS
 # EC firmware: cros_ec_ishtp registers it and cros-ec-light exposes the ambient
 # light sensor. The kernel picks the file by name (CRC32 of "Google" and "Ruby").
+# Also blacklists acpi_als, the firmware's ACPI light sensor, which always reads 0.
 set -eu
+assets=$(dirname "$0")/../assets/installed
 [ "$(id -u)" = 0 ] || { echo 'Run as root' >&2; exit 1; }
 [ "$(cat /sys/class/dmi/id/product_name)" = Ruby ] || { echo 'Not a Ruby board' >&2; exit 1; }
 for tool in lpunpack fsck.erofs; do
@@ -24,4 +26,5 @@ mkdir "$work/vendor"
 fsck.erofs --extract="$work/vendor" --no-preserve "$work/vendor_a.img" >/dev/null
 [ -s "$work/vendor/firmware/$fw" ] || { echo "Factory image lacks $fw" >&2; exit 1; }
 install -Dm644 "$work/vendor/firmware/$fw" "/usr/lib/firmware/updates/$fw"
-echo 'Ruby sensor hub firmware installed; reboot to load it.'
+install -Dm644 "$assets/ruby-sensors.conf" /etc/modprobe.d/ruby-sensors.conf
+echo 'Ruby sensor hub firmware installed and acpi_als blacklisted; reboot to load them.'
