@@ -1,0 +1,48 @@
+From 726b8f1f74c3be06d28d23de0a1bca9fd57e29ec Mon Sep 17 00:00:00 2001
+From: Nick Barrios <25010449+nbarrios@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:19:22 -0700
+Subject: [PATCH] crfpmoc: Report suspend as not supported
+
+crfpmoc_suspend() resets the sensor (FP_MODE 0) and then completed the
+suspend without an error, which per fpi_device_suspend_complete() means
+the current action continues after resume. The driver has no resume
+handler, so a verify running across suspend never matched: the sensor no
+longer waited for a finger while fprintd still had the verify in
+progress, and clients that restarted verification after resume got
+AlreadyInUse until they gave up. Seen with Noctalia's lock screen on a
+Google FPMCU (srebrna) over USB.
+
+Return FP_DEVICE_ERROR_NOT_SUPPORTED instead, so libfprint cancels the
+action and the client can start a new one after resume.
+---
+ libfprint/drivers/crfpmoc/crfpmoc.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/libfprint/drivers/crfpmoc/crfpmoc.c b/libfprint/drivers/crfpmoc/crfpmoc.c
+index 019fc794..ab4d0930 100644
+--- a/libfprint/drivers/crfpmoc/crfpmoc.c
++++ b/libfprint/drivers/crfpmoc/crfpmoc.c
+@@ -1270,8 +1270,11 @@ crfpmoc_suspend (FpDevice *device)
+ 
+   crfpmoc_reset_sync (device);
+ 
++  /* The reset leaves the sensor idle, so the current action cannot continue
++   * after resume: report that, and libfprint cancels it. The caller then
++   * sees the action fail and can start a new one after resume. */
+   fp_dbg ("crfpmoc_suspend: suspend_complete");
+-  fpi_device_suspend_complete (device, NULL);
++  fpi_device_suspend_complete (device, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+ }
+ 
+ static void
+@@ -2521,7 +2524,6 @@ fpi_device_crfpmoc_class_init (FpiDeviceCrfpMocClass *klass)
+   dev_class->open = crfpmoc_open;
+   dev_class->cancel = crfpmoc_cancel;
+   dev_class->suspend = crfpmoc_suspend;
+-  /* TODO: suspend but no resume ?? do we need either */
+   dev_class->close = crfpmoc_close;
+   dev_class->enroll = crfpmoc_enroll;
+   dev_class->identify = crfpmoc_identify_verify;
+-- 
+2.56.0
+
